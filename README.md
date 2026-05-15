@@ -10,9 +10,13 @@ A small .NET 10 console app that logs into your Telegram account and downloads v
 
 - Login with phone number + verification code (2FA supported); session is persisted so you only sign in once.
 - Browse recent chats / channels / groups.
-- Scan the last *N* messages of a peer and list all video documents (with filename, size, duration).
+- Scan the last *N* messages of a peer and list its media (filter by **video / photo / audio / document / all**).
+- **Search inside a chat** with `Messages_Search` and download matching media.
+- **Download by `t.me/…` message link** (public `t.me/<user>/<id>` and private `t.me/c/<chanId>/<id>`).
 - Bulk-select downloads via `1,3`, `1-5`, or `all`.
-- Live progress bar with throughput (MB/s).
+- **Parallel downloads** with configurable concurrency.
+- **Dedup across runs** — a JSON manifest in the output dir tracks `(chatId, msgId)` so already-downloaded items are skipped.
+- Live progress bar with throughput (MB/s) for single downloads; aggregate counter for parallel batches.
 - Configurable via `appsettings.json`, user-secrets, environment variables, or a local override file.
 - Graceful Ctrl+C shutdown.
 
@@ -35,8 +39,10 @@ PoC/
 │   ├── TelegramOptions.cs              # Bound options
 │   └── WTelegramConfigProvider.cs      # WTelegram config callback
 ├── Services/
-│   ├── TelegramService.cs              # Connect, resolve peer, list, download
-│   └── VideoItem.cs
+│   ├── TelegramService.cs              # Connect, resolve peer, list, search, download
+│   ├── MediaItem.cs                    # Unified wrapper over Document / Photo
+│   ├── DownloadManifest.cs             # JSON dedup of (chatId, msgId) → path
+│   └── MessageLinkResolver.cs          # Parses t.me/… message links
 ├── Ui/
 │   ├── ConsoleUi.cs                    # BackgroundService – interactive menu
 │   └── IConsolePrompt.cs
