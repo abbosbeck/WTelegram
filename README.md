@@ -29,29 +29,6 @@ A small .NET 10 console app that logs into your Telegram account and downloads v
 
 ---
 
-## Project layout
-
-```
-PoC/
-├── Program.cs                          # Composition root (Generic Host + DI)
-├── appsettings.json                    # Config skeleton
-├── Configuration/
-│   ├── TelegramOptions.cs              # Bound options
-│   └── WTelegramConfigProvider.cs      # WTelegram config callback
-├── Services/
-│   ├── TelegramService.cs              # Connect, resolve peer, list, search, download
-│   ├── MediaItem.cs                    # Unified wrapper over Document / Photo
-│   ├── DownloadManifest.cs             # JSON dedup of (chatId, msgId) → path
-│   └── MessageLinkResolver.cs          # Parses t.me/… message links
-├── Ui/
-│   ├── ConsoleUi.cs                    # BackgroundService – interactive menu
-│   └── IConsolePrompt.cs
-└── Helpers/
-    └── FileHelpers.cs                  # FormatSize, SanitizeFileName
-```
-
----
-
 ## Configuration
 
 The app reads configuration from these sources, in order (later wins):
@@ -150,7 +127,7 @@ Videos land in `OutputDirectory`. Existing filenames are suffixed with the messa
 ## Tech stack
 
 - .NET 10 / C# 14
-- [WTelegramClient](https://github.com/wiz0u/WTelegramClient) 4.4.4 (MTProto)
+-  MTProto
 - `Microsoft.Extensions.Hosting` (Generic Host, DI, options, logging)
 - `Microsoft.Extensions.Configuration.UserSecrets`
 
