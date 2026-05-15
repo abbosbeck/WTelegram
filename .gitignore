@@ -361,3 +361,11 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+
+# Telegram session files (contain auth keys – never commit!)
+*.session
+telegram_session*
+
+# Local config overrides
+appsettings.Development.json
+appsettings.Local.json
