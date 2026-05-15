@@ -28,15 +28,17 @@ internal sealed class DownloadManifest
         _entries = Load(_path, logger);
     }
 
-    public bool Contains(long chatId, int msgId) => _entries.ContainsKey(Key(chatId, msgId));
+    public bool Contains(long chatId, int msgId, bool isStory = false) =>
+        _entries.ContainsKey(Key(chatId, msgId, isStory));
 
-    public void Record(long chatId, int msgId, string filePath)
+    public void Record(long chatId, int msgId, string filePath, bool isStory = false)
     {
-        _entries[Key(chatId, msgId)] = filePath;
+        _entries[Key(chatId, msgId, isStory)] = filePath;
         Save();
     }
 
-    private static string Key(long chatId, int msgId) => $"{chatId}:{msgId}";
+    private static string Key(long chatId, int msgId, bool isStory) =>
+        isStory ? $"{chatId}:s{msgId}" : $"{chatId}:m{msgId}";
 
     private void Save()
     {

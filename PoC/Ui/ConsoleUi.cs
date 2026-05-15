@@ -3,7 +3,6 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using TelegramDownloader.Helpers;
 using TelegramDownloader.Services;
-using TL;
 
 namespace TelegramDownloader.Ui;
 
@@ -62,6 +61,8 @@ internal sealed class ConsoleUi : BackgroundService
             Console.WriteLine("2 – Search inside a chat & download");
             Console.WriteLine("3 – Download by message link (t.me/…)");
             Console.WriteLine("4 – List recent chats");
+            Console.WriteLine("5 – Download active stories from a user/channel");
+            Console.WriteLine("6 – Download pinned stories from a user/channel");
             Console.WriteLine("0 – Exit");
             Console.Write("Choice: ");
             var choice = _prompt.ReadLineTrimmed();
@@ -74,6 +75,8 @@ internal sealed class ConsoleUi : BackgroundService
                     case "2": await SearchAndDownloadFlowAsync(ct); break;
                     case "3": await DownloadByLinkFlowAsync(ct); break;
                     case "4": await _telegram.ListChatsAsync(ct); break;
+                    case "5": await DownloadActiveStoriesFlowAsync(ct); break;
+                    case "6": await DownloadPinnedStoriesFlowAsync(ct); break;
                     case "0": return;
                     default: Console.WriteLine("Unknown option.\n"); break;
                 }
@@ -137,6 +140,33 @@ internal sealed class ConsoleUi : BackgroundService
         await DownloadListAsync(new[] { item }, ct);
     }
 
+    // ── Flow 5: active stories ────────────────────────────────────────────────
+    private async Task DownloadActiveStoriesFlowAsync(CancellationToken ct)
+    {
+        var input = _prompt.Ask("\nEnter user/channel username or ID: ");
+        var (peer, peerId) = await _telegram.ResolvePeerAsync(input, ct);
+        var kinds = AskMediaKinds();
+
+        Console.WriteLine("\nFetching active stories…");
+        var items = await _telegram.GetActiveStoriesAsync(peer, peerId, kinds, ct);
+        await PromptAndDownloadAsync(items, ct);
+    }
+
+    // ── Flow 6: pinned stories ────────────────────────────────────────────────
+    private async Task DownloadPinnedStoriesFlowAsync(CancellationToken ct)
+    {
+        var input = _prompt.Ask("\nEnter user/channel username or ID: ");
+        var (peer, peerId) = await _telegram.ResolvePeerAsync(input, ct);
+
+        var limitStr = _prompt.Ask("How many pinned stories to fetch? [default 50]: ");
+        int limit = int.TryParse(limitStr, out var n) ? n : 50;
+        var kinds = AskMediaKinds();
+
+        Console.WriteLine($"\nFetching up to {limit} pinned stories…");
+        var items = await _telegram.GetPinnedStoriesAsync(peer, peerId, limit, kinds, ct);
+        await PromptAndDownloadAsync(items, ct);
+    }
+
     // ── Shared selection + dispatch ───────────────────────────────────────────
     private async Task PromptAndDownloadAsync(IReadOnlyList<MediaItem> items, CancellationToken ct)
     {
@@ -151,7 +181,8 @@ internal sealed class ConsoleUi : BackgroundService
         {
             var it = items[i];
             var dur = it.Duration is { } d ? $"  {d:mm\\:ss}" : "";
-            Console.WriteLine($"  [{i + 1}] [{it.Kind,-8}] MsgID={it.MsgId}  {it.DisplayName}  {FileHelpers.FormatSize(it.Size)}{dur}");
+            var idLabel = it.IsStory ? $"StoryID={it.MsgId}" : $"MsgID={it.MsgId}";
+            Console.WriteLine($"  [{i + 1}] [{it.Kind,-8}] {idLabel}  {it.DisplayName}  {FileHelpers.FormatSize(it.Size)}{dur}");
         }
 
         var sel = _prompt.Ask("\nWhich to download? (e.g. 1,3 or 1-5 or 'all', empty to cancel): ");

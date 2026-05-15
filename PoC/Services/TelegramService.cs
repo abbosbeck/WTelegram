@@ -105,6 +105,38 @@ internal sealed class TelegramService
         return ExtractMedia(result.Messages, chatId, kinds);
     }
 
+    // ── Stories ───────────────────────────────────────────────────────────────
+    public async Task<IReadOnlyList<MediaItem>> GetActiveStoriesAsync(
+        InputPeer peer, long peerId, IReadOnlySet<MediaKind> kinds, CancellationToken ct)
+    {
+        var result = await _client.Stories_GetPeerStories(peer).WaitAsync(ct);
+        return ExtractStories(result.stories?.stories, peerId, kinds);
+    }
+
+    public async Task<IReadOnlyList<MediaItem>> GetPinnedStoriesAsync(
+        InputPeer peer, long peerId, int limit, IReadOnlySet<MediaKind> kinds, CancellationToken ct)
+    {
+        var result = await _client.Stories_GetPinnedStories(peer, limit: limit).WaitAsync(ct);
+        return ExtractStories(result.stories, peerId, kinds);
+    }
+
+    private static IReadOnlyList<MediaItem> ExtractStories(
+        StoryItemBase[]? stories, long peerId, IReadOnlySet<MediaKind> kinds)
+    {
+        var items = new List<MediaItem>();
+        if (stories is null) return items;
+
+        foreach (var s in stories)
+        {
+            if (s is not StoryItem story) continue;
+            var item = MediaItem.TryFromStory(peerId, story);
+            if (item is null) continue;
+            if (kinds.Count > 0 && !kinds.Contains(item.Kind)) continue;
+            items.Add(item);
+        }
+        return items;
+    }
+
     private static IReadOnlyList<MediaItem> ExtractMedia(
         IEnumerable<MessageBase> messages, long chatId, IReadOnlySet<MediaKind> kinds)
     {
@@ -138,7 +170,7 @@ internal sealed class TelegramService
 
         await Parallel.ForEachAsync(items, opts, async (item, token) =>
         {
-            if (_manifest.Contains(item.ChatId, item.MsgId))
+            if (_manifest.Contains(item.ChatId, item.MsgId, item.IsStory))
             {
                 Interlocked.Increment(ref skipped);
                 int d = Interlocked.Increment(ref done);
@@ -207,7 +239,7 @@ internal sealed class TelegramService
         }
 
         if (!silentProgress) Console.WriteLine();
-        _manifest.Record(item.ChatId, item.MsgId, outPath);
+        _manifest.Record(item.ChatId, item.MsgId, outPath, item.IsStory);
         _logger.LogInformation("Saved {OutPath} in {Elapsed:mm\\:ss}", outPath, sw.Elapsed);
     }
 }

@@ -11,7 +11,7 @@ internal enum MediaKind
 }
 
 /// <summary>
-/// A unified wrapper over a downloadable Telegram message media object.
+/// A unified wrapper over a downloadable Telegram media object (from a message or a story).
 /// Exactly one of <see cref="Document"/> or <see cref="Photo"/> is non-null.
 /// </summary>
 internal sealed record MediaItem(
@@ -22,32 +22,39 @@ internal sealed record MediaItem(
     long Size,
     TimeSpan? Duration,
     Document? Document,
-    Photo? Photo)
+    Photo? Photo,
+    bool IsStory = false)
 {
-    public static MediaItem? TryFrom(long chatId, Message msg)
+    public static MediaItem? TryFrom(long chatId, Message msg) =>
+        FromMedia(chatId, msg.ID, msg.media, isStory: false);
+
+    public static MediaItem? TryFromStory(long peerId, StoryItem story) =>
+        FromMedia(peerId, story.id, story.media, isStory: true);
+
+    private static MediaItem? FromMedia(long chatId, int id, MessageMedia? media, bool isStory)
     {
-        switch (msg.media)
+        switch (media)
         {
             case MessageMediaDocument { document: Document doc }:
             {
                 var kind = ClassifyDocument(doc);
                 var name = doc.attributes.OfType<DocumentAttributeFilename>().FirstOrDefault()?.file_name
-                           ?? DefaultDocumentName(doc, kind);
+                           ?? DefaultDocumentName(doc, kind, isStory, id);
                 var video = doc.attributes.OfType<DocumentAttributeVideo>().FirstOrDefault();
                 var audio = doc.attributes.OfType<DocumentAttributeAudio>().FirstOrDefault();
                 TimeSpan? duration = video is not null
                     ? TimeSpan.FromSeconds(video.duration)
                     : audio is not null ? TimeSpan.FromSeconds(audio.duration) : null;
 
-                return new MediaItem(chatId, msg.ID, kind, name, doc.size, duration, doc, null);
+                return new MediaItem(chatId, id, kind, name, doc.size, duration, doc, null, isStory);
             }
 
             case MessageMediaPhoto { photo: Photo photo }:
             {
                 var largest = photo.LargestPhotoSize;
                 long size = largest?.FileSize ?? 0;
-                var name = $"photo_{photo.id}.jpg";
-                return new MediaItem(chatId, msg.ID, MediaKind.Photo, name, size, null, null, photo);
+                var name = isStory ? $"story_{id}_{photo.id}.jpg" : $"photo_{photo.id}.jpg";
+                return new MediaItem(chatId, id, MediaKind.Photo, name, size, null, null, photo, isStory);
             }
 
             default:
@@ -64,11 +71,15 @@ internal sealed record MediaItem(
         return MediaKind.Document;
     }
 
-    private static string DefaultDocumentName(Document doc, MediaKind kind) => kind switch
+    private static string DefaultDocumentName(Document doc, MediaKind kind, bool isStory, int id)
     {
-        MediaKind.Video => $"video_{doc.id}.mp4",
-        MediaKind.Audio => $"audio_{doc.id}.mp3",
-        MediaKind.Photo => $"image_{doc.id}.jpg",
-        _ => $"file_{doc.id}.bin"
-    };
+        var prefix = isStory ? $"story_{id}_" : "";
+        return kind switch
+        {
+            MediaKind.Video => $"{prefix}video_{doc.id}.mp4",
+            MediaKind.Audio => $"{prefix}audio_{doc.id}.mp3",
+            MediaKind.Photo => $"{prefix}image_{doc.id}.jpg",
+            _ => $"{prefix}file_{doc.id}.bin"
+        };
+    }
 }
