@@ -35,6 +35,8 @@ internal static class Program
             var provider = sp.GetRequiredService<WTelegramConfigProvider>();
             return new Client(provider.Provide);
         });
+        builder.Services.AddSingleton<DownloadManifest>();
+        builder.Services.AddSingleton<MessageLinkResolver>();
         builder.Services.AddSingleton<TelegramService>();
         builder.Services.AddHostedService<ConsoleUi>();
 

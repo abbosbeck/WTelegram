@@ -14,66 +14,57 @@ internal sealed class TelegramService
 
     private readonly Client _client;
     private readonly TelegramOptions _options;
+    private readonly DownloadManifest _manifest;
     private readonly ILogger<TelegramService> _logger;
 
-    public TelegramService(Client client, IOptions<TelegramOptions> options, ILogger<TelegramService> logger)
+    public TelegramService(
+        Client client,
+        IOptions<TelegramOptions> options,
+        DownloadManifest manifest,
+        ILogger<TelegramService> logger)
     {
         _client = client;
         _options = options.Value;
+        _manifest = manifest;
         _logger = logger;
     }
 
-    public async Task ConnectAsync(CancellationToken cancellationToken)
+    // ── Lifecycle ─────────────────────────────────────────────────────────────
+    public async Task ConnectAsync(CancellationToken ct)
     {
         _logger.LogInformation("Connecting to Telegram…");
-        await _client.LoginUserIfNeeded().WaitAsync(cancellationToken);
+        await _client.LoginUserIfNeeded().WaitAsync(ct);
         _logger.LogInformation("Logged in as: {User}", _client.User);
     }
 
-    public async Task<InputPeer> ResolvePeerAsync(string input, CancellationToken cancellationToken)
+    // ── Peer / chat resolution ────────────────────────────────────────────────
+    public async Task<(InputPeer Peer, long ChatId)> ResolvePeerAsync(string input, CancellationToken ct)
     {
         if (long.TryParse(input, out var numId))
         {
-            var contacts = await _client.Messages_GetAllDialogs().WaitAsync(cancellationToken);
+            var contacts = await _client.Messages_GetAllDialogs().WaitAsync(ct);
             if (contacts.chats.TryGetValue(numId, out var chat))
-                return chat.ToInputPeer();
+                return (chat.ToInputPeer(), numId);
             if (contacts.users.TryGetValue(numId, out var user))
-                return user.ToInputPeer();
+                return (user.ToInputPeer(), numId);
             throw new InvalidOperationException($"ID {numId} not found in dialogs.");
         }
 
         var username = input.TrimStart('@');
-        var resolved = await _client.Contacts_ResolveUsername(username).WaitAsync(cancellationToken);
+        var resolved = await _client.Contacts_ResolveUsername(username).WaitAsync(ct);
         return resolved.peer switch
         {
-            PeerChannel c => resolved.chats[c.channel_id].ToInputPeer(),
-            PeerChat g => resolved.chats[g.chat_id].ToInputPeer(),
-            PeerUser u => resolved.users[u.user_id].ToInputPeer(),
+            PeerChannel c => (resolved.chats[c.channel_id].ToInputPeer(), c.channel_id),
+            PeerChat g => (resolved.chats[g.chat_id].ToInputPeer(), g.chat_id),
+            PeerUser u => (resolved.users[u.user_id].ToInputPeer(), u.user_id),
             _ => throw new InvalidOperationException("Unknown peer type.")
         };
     }
 
-    public async Task<IReadOnlyList<VideoItem>> GetVideosAsync(InputPeer peer, int limit, CancellationToken cancellationToken)
-    {
-        var messages = await _client.Messages_GetHistory(peer, limit: limit).WaitAsync(cancellationToken);
-
-        var videos = new List<VideoItem>();
-        foreach (var msg in messages.Messages)
-        {
-            if (msg is Message { media: MessageMediaDocument { document: Document doc } }
-                && doc.mime_type.StartsWith("video/"))
-            {
-                videos.Add(new VideoItem(msg.ID, doc));
-            }
-        }
-
-        return videos;
-    }
-
-    public async Task ListChatsAsync(CancellationToken cancellationToken)
+    public async Task ListChatsAsync(CancellationToken ct)
     {
         Console.WriteLine("\nLoading dialogs…");
-        var dialogs = await _client.Messages_GetAllDialogs().WaitAsync(cancellationToken);
+        var dialogs = await _client.Messages_GetAllDialogs().WaitAsync(ct);
 
         Console.WriteLine($"\n{"ID",-15} {"Type",-10} {"Title"}");
         Console.WriteLine(new string('─', 60));
@@ -99,34 +90,124 @@ internal sealed class TelegramService
         Console.WriteLine();
     }
 
-    public async Task DownloadDocumentAsync(Document doc, int msgId, CancellationToken cancellationToken)
+    // ── Media discovery ───────────────────────────────────────────────────────
+    public async Task<IReadOnlyList<MediaItem>> GetMediaAsync(
+        InputPeer peer, long chatId, int limit, IReadOnlySet<MediaKind> kinds, CancellationToken ct)
+    {
+        var messages = await _client.Messages_GetHistory(peer, limit: limit).WaitAsync(ct);
+        return ExtractMedia(messages.Messages, chatId, kinds);
+    }
+
+    public async Task<IReadOnlyList<MediaItem>> SearchMediaAsync(
+        InputPeer peer, long chatId, string query, IReadOnlySet<MediaKind> kinds, int limit, CancellationToken ct)
+    {
+        var result = await _client.Messages_Search(peer, query, limit: limit).WaitAsync(ct);
+        return ExtractMedia(result.Messages, chatId, kinds);
+    }
+
+    private static IReadOnlyList<MediaItem> ExtractMedia(
+        IEnumerable<MessageBase> messages, long chatId, IReadOnlySet<MediaKind> kinds)
+    {
+        var items = new List<MediaItem>();
+        foreach (var msg in messages)
+        {
+            if (msg is not Message m) continue;
+            var item = MediaItem.TryFrom(chatId, m);
+            if (item is null) continue;
+            if (kinds.Count > 0 && !kinds.Contains(item.Kind)) continue;
+            items.Add(item);
+        }
+        return items;
+    }
+
+    // ── Download ──────────────────────────────────────────────────────────────
+    public async Task<int> DownloadManyAsync(
+        IReadOnlyList<MediaItem> items,
+        Action<int, int> onCompleted,
+        CancellationToken ct)
+    {
+        int parallel = Math.Max(1, _options.MaxConcurrentDownloads);
+        int done = 0;
+        int skipped = 0;
+
+        var opts = new ParallelOptions
+        {
+            MaxDegreeOfParallelism = parallel,
+            CancellationToken = ct
+        };
+
+        await Parallel.ForEachAsync(items, opts, async (item, token) =>
+        {
+            if (_manifest.Contains(item.ChatId, item.MsgId))
+            {
+                Interlocked.Increment(ref skipped);
+                int d = Interlocked.Increment(ref done);
+                onCompleted(d, items.Count);
+                _logger.LogInformation("Skipping already-downloaded {MsgId} ({Name})", item.MsgId, item.DisplayName);
+                return;
+            }
+
+            try
+            {
+                bool silent = parallel > 1;
+                await DownloadMediaAsync(item, silent, token);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to download msg {MsgId} ({Name})", item.MsgId, item.DisplayName);
+            }
+
+            int d2 = Interlocked.Increment(ref done);
+            onCompleted(d2, items.Count);
+        });
+
+        return skipped;
+    }
+
+    public async Task DownloadMediaAsync(MediaItem item, bool silentProgress, CancellationToken ct)
     {
         var outputDir = _options.ResolvedOutputDirectory;
-        var attr = doc.attributes.OfType<DocumentAttributeFilename>().FirstOrDefault();
-        var fileName = FileHelpers.SanitizeFileName(attr?.file_name ?? $"{doc.id}.mp4");
+        Directory.CreateDirectory(outputDir);
+
+        var fileName = FileHelpers.SanitizeFileName(item.DisplayName);
         var outPath = Path.Combine(outputDir, fileName);
 
         if (File.Exists(outPath))
         {
             var stem = Path.GetFileNameWithoutExtension(outPath);
             var ext = Path.GetExtension(outPath);
-            outPath = Path.Combine(outputDir, $"{stem}_{msgId}{ext}");
+            outPath = Path.Combine(outputDir, $"{stem}_{item.MsgId}{ext}");
         }
 
-        _logger.LogInformation("Downloading {FileName} ({Size}) to {OutPath}",
-            fileName, FileHelpers.FormatSize(doc.size), outPath);
+        _logger.LogInformation("Downloading {Kind} {Name} ({Size}) → {OutPath}",
+            item.Kind, fileName, FileHelpers.FormatSize(item.Size), outPath);
 
         var sw = System.Diagnostics.Stopwatch.StartNew();
 
-        await using var fs = new FileStream(outPath, FileMode.Create, FileAccess.Write,
-                                             FileShare.None, FileBufferSize, useAsync: true);
+        await using (var fs = new FileStream(outPath, FileMode.Create, FileAccess.Write,
+                                              FileShare.None, FileBufferSize, useAsync: true))
+        {
+            Client.ProgressCallback? cb = silentProgress
+                ? null
+                : (transferred, total) => ConsoleUi.PrintProgress(transferred, total, sw.Elapsed);
 
-        await _client.DownloadFileAsync(doc, fs,
-            progress: (transferred, total) => ConsoleUi.PrintProgress(transferred, total, sw.Elapsed))
-            .WaitAsync(cancellationToken);
+            if (item.Document is not null)
+            {
+                await _client.DownloadFileAsync(item.Document, fs, progress: cb).WaitAsync(ct);
+            }
+            else if (item.Photo is not null)
+            {
+                await _client.DownloadFileAsync(item.Photo, fs, progress: cb).WaitAsync(ct);
+            }
+            else
+            {
+                throw new InvalidOperationException("MediaItem has neither Document nor Photo.");
+            }
+        }
 
-        Console.WriteLine();
-        _logger.LogInformation("Saved {OutPath} ({Size} in {Elapsed:mm\\:ss})",
-            outPath, FileHelpers.FormatSize(doc.size), sw.Elapsed);
+        if (!silentProgress) Console.WriteLine();
+        _manifest.Record(item.ChatId, item.MsgId, outPath);
+        _logger.LogInformation("Saved {OutPath} in {Elapsed:mm\\:ss}", outPath, sw.Elapsed);
     }
 }

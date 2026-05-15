@@ -13,17 +13,20 @@ internal sealed class ConsoleUi : BackgroundService
     private const int DefaultMessageScanLimit = 50;
 
     private readonly TelegramService _telegram;
+    private readonly MessageLinkResolver _linkResolver;
     private readonly IConsolePrompt _prompt;
     private readonly IHostApplicationLifetime _lifetime;
     private readonly ILogger<ConsoleUi> _logger;
 
     public ConsoleUi(
         TelegramService telegram,
+        MessageLinkResolver linkResolver,
         IConsolePrompt prompt,
         IHostApplicationLifetime lifetime,
         ILogger<ConsoleUi> logger)
     {
         _telegram = telegram;
+        _linkResolver = linkResolver;
         _prompt = prompt;
         _lifetime = lifetime;
         _logger = logger;
@@ -50,75 +53,153 @@ internal sealed class ConsoleUi : BackgroundService
         }
     }
 
-    private async Task RunMenuAsync(CancellationToken cancellationToken)
+    private async Task RunMenuAsync(CancellationToken ct)
     {
-        while (!cancellationToken.IsCancellationRequested)
+        while (!ct.IsCancellationRequested)
         {
             Console.WriteLine("════════════════════════════════════");
-            Console.WriteLine("1 – Download video from a chat/channel");
-            Console.WriteLine("2 – List recent chats");
+            Console.WriteLine("1 – Download media from a chat/channel");
+            Console.WriteLine("2 – Search inside a chat & download");
+            Console.WriteLine("3 – Download by message link (t.me/…)");
+            Console.WriteLine("4 – List recent chats");
             Console.WriteLine("0 – Exit");
             Console.Write("Choice: ");
             var choice = _prompt.ReadLineTrimmed();
 
-            switch (choice)
+            try
             {
-                case "1": await DownloadVideoFlowAsync(cancellationToken); break;
-                case "2": await _telegram.ListChatsAsync(cancellationToken); break;
-                case "0": return;
-                default: Console.WriteLine("Unknown option.\n"); break;
+                switch (choice)
+                {
+                    case "1": await DownloadFromChatFlowAsync(ct); break;
+                    case "2": await SearchAndDownloadFlowAsync(ct); break;
+                    case "3": await DownloadByLinkFlowAsync(ct); break;
+                    case "4": await _telegram.ListChatsAsync(ct); break;
+                    case "0": return;
+                    default: Console.WriteLine("Unknown option.\n"); break;
+                }
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Operation failed");
             }
         }
     }
 
-    private async Task DownloadVideoFlowAsync(CancellationToken cancellationToken)
+    // ── Flow 1: scan history ──────────────────────────────────────────────────
+    private async Task DownloadFromChatFlowAsync(CancellationToken ct)
     {
         var input = _prompt.Ask("\nEnter chat username or ID (e.g. @mychannel or 123456789): ");
-
-        InputPeer peer;
-        try
-        {
-            peer = await _telegram.ResolvePeerAsync(input, cancellationToken);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Could not resolve chat '{Input}'", input);
-            return;
-        }
+        var (peer, chatId) = await _telegram.ResolvePeerAsync(input, ct);
 
         var limitStr = _prompt.Ask($"How many recent messages to scan? [default {DefaultMessageScanLimit}]: ");
         int limit = int.TryParse(limitStr, out var n) ? n : DefaultMessageScanLimit;
 
-        Console.WriteLine($"\nFetching last {limit} messages…");
-        var videos = await _telegram.GetVideosAsync(peer, limit, cancellationToken);
+        var kinds = AskMediaKinds();
 
-        if (videos.Count == 0)
+        Console.WriteLine($"\nFetching last {limit} messages…");
+        var items = await _telegram.GetMediaAsync(peer, chatId, limit, kinds, ct);
+
+        await PromptAndDownloadAsync(items, ct);
+    }
+
+    // ── Flow 2: in-chat search ────────────────────────────────────────────────
+    private async Task SearchAndDownloadFlowAsync(CancellationToken ct)
+    {
+        var input = _prompt.Ask("\nEnter chat username or ID: ");
+        var (peer, chatId) = await _telegram.ResolvePeerAsync(input, ct);
+
+        var query = _prompt.Ask("Search query (text to match in messages): ");
+        var kinds = AskMediaKinds();
+        var limitStr = _prompt.Ask("Max results [default 100]: ");
+        int limit = int.TryParse(limitStr, out var n) ? n : 100;
+
+        Console.WriteLine($"\nSearching for \"{query}\"…");
+        var items = await _telegram.SearchMediaAsync(peer, chatId, query, kinds, limit, ct);
+
+        await PromptAndDownloadAsync(items, ct);
+    }
+
+    // ── Flow 3: direct link ───────────────────────────────────────────────────
+    private async Task DownloadByLinkFlowAsync(CancellationToken ct)
+    {
+        var link = _prompt.Ask("\nPaste t.me message link: ");
+        var (_, chatId, msg) = await _linkResolver.ResolveAsync(link, ct);
+
+        var item = MediaItem.TryFrom(chatId, msg);
+        if (item is null)
         {
-            Console.WriteLine("No video messages found in that range.\n");
+            Console.WriteLine("That message has no downloadable media.\n");
             return;
         }
 
-        Console.WriteLine($"\nFound {videos.Count} video(s):\n");
-        for (int i = 0; i < videos.Count; i++)
+        Console.WriteLine($"Found: [{item.Kind}] {item.DisplayName} ({FileHelpers.FormatSize(item.Size)})");
+        await DownloadListAsync(new[] { item }, ct);
+    }
+
+    // ── Shared selection + dispatch ───────────────────────────────────────────
+    private async Task PromptAndDownloadAsync(IReadOnlyList<MediaItem> items, CancellationToken ct)
+    {
+        if (items.Count == 0)
         {
-            var (msgId, doc) = videos[i];
-            var attr = doc.attributes.OfType<DocumentAttributeFilename>().FirstOrDefault();
-            var video = doc.attributes.OfType<DocumentAttributeVideo>().FirstOrDefault();
-            var name = attr?.file_name ?? $"video_{doc.id}";
-            var size = FileHelpers.FormatSize(doc.size);
-            var dur = video is not null ? TimeSpan.FromSeconds(video.duration).ToString(@"mm\:ss") : "?";
-            Console.WriteLine($"  [{i + 1}] MsgID={msgId}  {name}  {size}  {dur}");
+            Console.WriteLine("No matching media found.\n");
+            return;
         }
 
-        var sel = _prompt.Ask("\nWhich video(s) to download? (e.g. 1,3 or 1-5 or 'all'): ");
-        var indices = ParseSelection(sel, videos.Count);
-
-        foreach (var idx in indices)
+        Console.WriteLine($"\nFound {items.Count} item(s):\n");
+        for (int i = 0; i < items.Count; i++)
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            var (msgId, doc) = videos[idx];
-            await _telegram.DownloadDocumentAsync(doc, msgId, cancellationToken);
+            var it = items[i];
+            var dur = it.Duration is { } d ? $"  {d:mm\\:ss}" : "";
+            Console.WriteLine($"  [{i + 1}] [{it.Kind,-8}] MsgID={it.MsgId}  {it.DisplayName}  {FileHelpers.FormatSize(it.Size)}{dur}");
         }
+
+        var sel = _prompt.Ask("\nWhich to download? (e.g. 1,3 or 1-5 or 'all', empty to cancel): ");
+        if (string.IsNullOrWhiteSpace(sel)) return;
+
+        var indices = ParseSelection(sel, items.Count).ToList();
+        var selected = indices.Select(i => items[i]).ToList();
+
+        await DownloadListAsync(selected, ct);
+    }
+
+    private async Task DownloadListAsync(IReadOnlyList<MediaItem> selected, CancellationToken ct)
+    {
+        if (selected.Count == 0) return;
+
+        Console.WriteLine($"\nStarting {selected.Count} download(s)…\n");
+        int skipped = await _telegram.DownloadManyAsync(selected,
+            onCompleted: (done, total) =>
+            {
+                Console.Write($"\r  progress: {done}/{total} completed   ");
+            },
+            ct);
+
+        Console.WriteLine();
+        Console.WriteLine($"Done. Downloaded: {selected.Count - skipped}, skipped (already present): {skipped}.\n");
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+    private IReadOnlySet<MediaKind> AskMediaKinds()
+    {
+        var raw = _prompt.Ask("Media kinds [v=video, p=photo, a=audio, d=document, all] [default v]: ");
+        if (string.IsNullOrWhiteSpace(raw)) raw = "v";
+        if (raw.Equals("all", StringComparison.OrdinalIgnoreCase))
+            return new HashSet<MediaKind> { MediaKind.Video, MediaKind.Photo, MediaKind.Audio, MediaKind.Document };
+
+        var set = new HashSet<MediaKind>();
+        foreach (var ch in raw.ToLowerInvariant())
+        {
+            switch (ch)
+            {
+                case 'v': set.Add(MediaKind.Video); break;
+                case 'p': set.Add(MediaKind.Photo); break;
+                case 'a': set.Add(MediaKind.Audio); break;
+                case 'd': set.Add(MediaKind.Document); break;
+            }
+        }
+        if (set.Count == 0) set.Add(MediaKind.Video);
+        return set;
     }
 
     private static IEnumerable<int> ParseSelection(string sel, int max)
