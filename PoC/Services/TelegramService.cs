@@ -110,13 +110,16 @@ internal sealed class TelegramService
         InputPeer peer, long peerId, IReadOnlySet<MediaKind> kinds, CancellationToken ct)
     {
         var result = await _client.Stories_GetPeerStories(peer).WaitAsync(ct);
-        return ExtractStories(result.stories?.stories, peerId, kinds);
+        var raw = result.stories?.stories;
+        _logger.LogInformation("Stories_GetPeerStories returned {Count} story item(s)", raw?.Length ?? 0);
+        return ExtractStories(raw, peerId, kinds);
     }
 
     public async Task<IReadOnlyList<MediaItem>> GetPinnedStoriesAsync(
         InputPeer peer, long peerId, int limit, IReadOnlySet<MediaKind> kinds, CancellationToken ct)
     {
         var result = await _client.Stories_GetPinnedStories(peer, limit: limit).WaitAsync(ct);
+        _logger.LogInformation("Stories_GetPinnedStories returned {Count} story item(s)", result.stories?.Length ?? 0);
         return ExtractStories(result.stories, peerId, kinds);
     }
 
