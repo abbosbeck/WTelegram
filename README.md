@@ -1,6 +1,6 @@
 # TelegramDownloader
 
-A small .NET 10 console app that logs into your Telegram account via [WTelegramClient](https://github.com/wiz0u/WTelegramClient) (MTProto) and downloads videos from any chat or channel you have access to.
+A small .NET 10 console app that logs into your Telegram account and downloads videos from any chat or channel you have access to.
 
 > ⚠️ **Personal-use tool.** It uses *your* Telegram account, not the Bot API. Don't use it to scrape content you don't have the right to download.
 
