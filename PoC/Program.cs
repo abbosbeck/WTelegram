@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using TelegramDownloader.Configuration;
 using TelegramDownloader.Services;
@@ -41,6 +42,10 @@ internal static class Program
         builder.Services.AddHostedService<ConsoleUi>();
 
         using var host = builder.Build();
+
+        var wtLogger = host.Services.GetRequiredService<ILoggerFactory>().CreateLogger("WTelegram");
+        WTelegram.Helpers.Log = (level, message) => wtLogger.Log((LogLevel)level, "{Message}", message);
+
         await host.RunAsync();
     }
 }
