@@ -11,6 +11,8 @@ internal sealed class ConsoleUi : BackgroundService
     private const int ProgressBarWidth = 50;
     private const int DefaultMessageScanLimit = 50;
 
+    private static readonly IReadOnlySet<MediaKind> AllKinds = new HashSet<MediaKind>();
+
     private readonly TelegramService _telegram;
     private readonly MessageLinkResolver _linkResolver;
     private readonly IConsolePrompt _prompt;
@@ -145,10 +147,9 @@ internal sealed class ConsoleUi : BackgroundService
     {
         var input = _prompt.Ask("\nEnter user/channel username or ID: ");
         var (peer, peerId) = await _telegram.ResolvePeerAsync(input, ct);
-        var kinds = AskMediaKinds();
 
         Console.WriteLine("\nFetching active stories…");
-        var items = await _telegram.GetActiveStoriesAsync(peer, peerId, kinds, ct);
+        var items = await _telegram.GetActiveStoriesAsync(peer, peerId, AllKinds, ct);
         await PromptAndDownloadAsync(items, ct);
     }
 
@@ -160,10 +161,9 @@ internal sealed class ConsoleUi : BackgroundService
 
         var limitStr = _prompt.Ask("How many pinned stories to fetch? [default 50]: ");
         int limit = int.TryParse(limitStr, out var n) ? n : 50;
-        var kinds = AskMediaKinds();
 
         Console.WriteLine($"\nFetching up to {limit} pinned stories…");
-        var items = await _telegram.GetPinnedStoriesAsync(peer, peerId, limit, kinds, ct);
+        var items = await _telegram.GetPinnedStoriesAsync(peer, peerId, limit, AllKinds, ct);
         await PromptAndDownloadAsync(items, ct);
     }
 
