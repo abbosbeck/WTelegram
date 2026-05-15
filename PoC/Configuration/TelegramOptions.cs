@@ -8,6 +8,8 @@ internal sealed class TelegramOptions
     public string ApiHash { get; set; } = "";
     public string OutputDirectory { get; set; } = "";
     public string SessionPathname { get; set; } = "telegram_session.dat";
+    public string ManifestFileName { get; set; } = ".downloaded.json";
+    public int MaxConcurrentDownloads { get; set; } = 3;
 
     public string ResolvedOutputDirectory =>
         string.IsNullOrWhiteSpace(OutputDirectory)
