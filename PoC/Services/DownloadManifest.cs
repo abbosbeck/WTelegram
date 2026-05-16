@@ -37,6 +37,17 @@ internal sealed class DownloadManifest
         Save();
     }
 
+    public bool ContainsUrl(string urlKey) => _entries.ContainsKey("url:" + urlKey);
+
+    public string? GetUrlPath(string urlKey) =>
+        _entries.TryGetValue("url:" + urlKey, out var v) ? v : null;
+
+    public void RecordUrl(string urlKey, string filePath)
+    {
+        _entries["url:" + urlKey] = filePath;
+        Save();
+    }
+
     private static string Key(long chatId, int msgId, bool isStory) =>
         isStory ? $"{chatId}:s{msgId}" : $"{chatId}:m{msgId}";
 

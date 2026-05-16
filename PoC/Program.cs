@@ -27,6 +27,10 @@ internal static class Program
             .Bind(builder.Configuration.GetSection(TelegramOptions.SectionName))
             .ValidateOnStart();
 
+        builder.Services
+            .AddOptions<WebDownloaderOptions>()
+            .Bind(builder.Configuration.GetSection(WebDownloaderOptions.SectionName));
+
         builder.Services.AddSingleton<IConsolePrompt, ConsolePrompt>();
         builder.Services.AddSingleton<WTelegramConfigProvider>();
         builder.Services.AddSingleton<Client>(sp =>
@@ -39,6 +43,7 @@ internal static class Program
         builder.Services.AddSingleton<DownloadManifest>();
         builder.Services.AddSingleton<MessageLinkResolver>();
         builder.Services.AddSingleton<TelegramService>();
+        builder.Services.AddSingleton<WebVideoDownloader>();
         builder.Services.AddHostedService<ConsoleUi>();
 
         using var host = builder.Build();

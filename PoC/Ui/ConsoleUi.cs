@@ -15,6 +15,7 @@ internal sealed class ConsoleUi : BackgroundService
 
     private readonly TelegramService _telegram;
     private readonly MessageLinkResolver _linkResolver;
+    private readonly WebVideoDownloader _webDownloader;
     private readonly IConsolePrompt _prompt;
     private readonly IHostApplicationLifetime _lifetime;
     private readonly ILogger<ConsoleUi> _logger;
@@ -22,12 +23,14 @@ internal sealed class ConsoleUi : BackgroundService
     public ConsoleUi(
         TelegramService telegram,
         MessageLinkResolver linkResolver,
+        WebVideoDownloader webDownloader,
         IConsolePrompt prompt,
         IHostApplicationLifetime lifetime,
         ILogger<ConsoleUi> logger)
     {
         _telegram = telegram;
         _linkResolver = linkResolver;
+        _webDownloader = webDownloader;
         _prompt = prompt;
         _lifetime = lifetime;
         _logger = logger;
@@ -65,6 +68,7 @@ internal sealed class ConsoleUi : BackgroundService
             Console.WriteLine("4 – List recent chats");
             Console.WriteLine("5 – Download active stories from a user/channel");
             Console.WriteLine("6 – Download pinned stories from a user/channel");
+            Console.WriteLine("7 – Download video from URL (YouTube, Instagram, TikTok, …)");
             Console.WriteLine("0 – Exit");
             Console.Write("Choice: ");
             var choice = _prompt.ReadLineTrimmed();
@@ -79,6 +83,7 @@ internal sealed class ConsoleUi : BackgroundService
                     case "4": await _telegram.ListChatsAsync(ct); break;
                     case "5": await DownloadActiveStoriesFlowAsync(ct); break;
                     case "6": await DownloadPinnedStoriesFlowAsync(ct); break;
+                    case "7": await DownloadFromUrlFlowAsync(ct); break;
                     case "0": return;
                     default: Console.WriteLine("Unknown option.\n"); break;
                 }
@@ -165,6 +170,32 @@ internal sealed class ConsoleUi : BackgroundService
         Console.WriteLine($"\nFetching up to {limit} pinned stories…");
         var items = await _telegram.GetPinnedStoriesAsync(peer, peerId, limit, AllKinds, ct);
         await PromptAndDownloadAsync(items, ct);
+    }
+
+    // ── Flow 7: URL via yt-dlp ────────────────────────────────────────────────
+    private async Task DownloadFromUrlFlowAsync(CancellationToken ct)
+    {
+        var url = _prompt.Ask("\nPaste video URL (YouTube, Instagram, TikTok, …): ");
+        if (string.IsNullOrWhiteSpace(url))
+        {
+            Console.WriteLine("No URL provided.\n");
+            return;
+        }
+
+        var modeRaw = _prompt.Ask("Download mode [v=video, a=audio only] [default v]: ");
+        bool audioOnly = !string.IsNullOrWhiteSpace(modeRaw)
+                         && modeRaw.Trim().StartsWith("a", StringComparison.OrdinalIgnoreCase);
+
+        try
+        {
+            var path = await _webDownloader.DownloadAsync(url, audioOnly, ct);
+            Console.WriteLine($"Done. Saved to: {path}\n");
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "URL download failed");
+        }
     }
 
     // ── Shared selection + dispatch ───────────────────────────────────────────
