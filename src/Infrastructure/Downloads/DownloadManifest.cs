@@ -1,0 +1,86 @@
+using System.Collections.Concurrent;
+using System.Text.Json;
+using Application.Configuration;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+
+namespace Infrastructure.Downloads;
+
+/// <summary>
+/// Tracks already-downloaded items in a JSON file under the output directory
+/// so we can skip duplicates across runs.
+/// </summary>
+public sealed class DownloadManifest
+{
+    private static readonly JsonSerializerOptions JsonOpts = new() { WriteIndented = true };
+
+    private readonly string _path;
+    private readonly ILogger<DownloadManifest> _logger;
+    private readonly ConcurrentDictionary<string, string> _entries;
+    private readonly Lock _saveLock = new();
+
+    public DownloadManifest(IOptions<TelegramOptions> options, ILogger<DownloadManifest> logger)
+    {
+        _logger = logger;
+        var opts = options.Value;
+        Directory.CreateDirectory(opts.ResolvedOutputDirectory);
+        _path = Path.Combine(opts.ResolvedOutputDirectory, opts.ManifestFileName);
+        _entries = Load(_path, logger);
+    }
+
+    public bool Contains(long chatId, int msgId, bool isStory = false) =>
+        _entries.ContainsKey(Key(chatId, msgId, isStory));
+
+    public void Record(long chatId, int msgId, string filePath, bool isStory = false)
+    {
+        _entries[Key(chatId, msgId, isStory)] = filePath;
+        Save();
+    }
+
+    public bool ContainsUrl(string urlKey) => _entries.ContainsKey("url:" + urlKey);
+
+    public string? GetUrlPath(string urlKey) =>
+        _entries.TryGetValue("url:" + urlKey, out var v) ? v : null;
+
+    public void RecordUrl(string urlKey, string filePath)
+    {
+        _entries["url:" + urlKey] = filePath;
+        Save();
+    }
+
+    private static string Key(long chatId, int msgId, bool isStory) =>
+        isStory ? $"{chatId}:s{msgId}" : $"{chatId}:m{msgId}";
+
+    private void Save()
+    {
+        lock (_saveLock)
+        {
+            try
+            {
+                var json = JsonSerializer.Serialize(_entries, JsonOpts);
+                File.WriteAllText(_path, json);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to write manifest {Path}", _path);
+            }
+        }
+    }
+
+    private static ConcurrentDictionary<string, string> Load(string path, ILogger logger)
+    {
+        if (!File.Exists(path)) return new ConcurrentDictionary<string, string>();
+        try
+        {
+            var json = File.ReadAllText(path);
+            var dict = JsonSerializer.Deserialize<Dictionary<string, string>>(json)
+                       ?? new Dictionary<string, string>();
+            return new ConcurrentDictionary<string, string>(dict);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Failed to read manifest {Path}; starting fresh", path);
+            return new ConcurrentDictionary<string, string>();
+        }
+    }
+}
