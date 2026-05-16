@@ -41,6 +41,26 @@ internal sealed class PostgresSessionStream : Stream
     {
         _phone = phone;
         _displayName = displayName;
+
+        byte[] snapshot;
+        lock (_flushLock)
+        {
+            snapshot = _buffer.ToArray();
+            _dirty = false;
+            _lastFlush = DateTime.UtcNow;
+        }
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await _store.SaveAsync(_userId, snapshot, phone, displayName);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to persist session identity for user {UserId}", _userId);
+            }
+        });
     }
 
     public override bool CanRead => true;
