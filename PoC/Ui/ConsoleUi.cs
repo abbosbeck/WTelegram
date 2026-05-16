@@ -40,7 +40,6 @@ internal sealed class ConsoleUi : BackgroundService
     {
         try
         {
-            await _telegram.ConnectAsync(stoppingToken);
             await RunMenuAsync(stoppingToken);
         }
         catch (OperationCanceledException)
@@ -80,7 +79,7 @@ internal sealed class ConsoleUi : BackgroundService
                     case "1": await DownloadFromChatFlowAsync(ct); break;
                     case "2": await SearchAndDownloadFlowAsync(ct); break;
                     case "3": await DownloadByLinkFlowAsync(ct); break;
-                    case "4": await _telegram.ListChatsAsync(ct); break;
+                    case "4": await ListChatsFlowAsync(ct); break;
                     case "5": await DownloadActiveStoriesFlowAsync(ct); break;
                     case "6": await DownloadPinnedStoriesFlowAsync(ct); break;
                     case "7": await DownloadFromUrlFlowAsync(ct); break;
@@ -117,6 +116,7 @@ internal sealed class ConsoleUi : BackgroundService
     private async Task SearchAndDownloadFlowAsync(CancellationToken ct)
     {
         var input = _prompt.Ask("\nEnter chat username or ID: ");
+        await _telegram.EnsureConnectedAsync(ct);
         var (peer, chatId) = await _telegram.ResolvePeerAsync(input, ct);
 
         var query = _prompt.Ask("Search query (text to match in messages): ");
@@ -151,6 +151,7 @@ internal sealed class ConsoleUi : BackgroundService
     private async Task DownloadActiveStoriesFlowAsync(CancellationToken ct)
     {
         var input = _prompt.Ask("\nEnter user/channel username or ID: ");
+        await _telegram.EnsureConnectedAsync(ct);
         var (peer, peerId) = await _telegram.ResolvePeerAsync(input, ct);
 
         Console.WriteLine("\nFetching active stories…");
@@ -162,6 +163,7 @@ internal sealed class ConsoleUi : BackgroundService
     private async Task DownloadPinnedStoriesFlowAsync(CancellationToken ct)
     {
         var input = _prompt.Ask("\nEnter user/channel username or ID: ");
+        await _telegram.EnsureConnectedAsync(ct);
         var (peer, peerId) = await _telegram.ResolvePeerAsync(input, ct);
 
         var limitStr = _prompt.Ask("How many pinned stories to fetch? [default 50]: ");
@@ -170,6 +172,13 @@ internal sealed class ConsoleUi : BackgroundService
         Console.WriteLine($"\nFetching up to {limit} pinned stories…");
         var items = await _telegram.GetPinnedStoriesAsync(peer, peerId, limit, AllKinds, ct);
         await PromptAndDownloadAsync(items, ct);
+    }
+
+    // ── Flow 4: list chats ─────────────────────────────────────────────────────
+    private async Task ListChatsFlowAsync(CancellationToken ct)
+    {
+        await _telegram.EnsureConnectedAsync(ct);
+        await _telegram.ListChatsAsync(ct);
     }
 
     // ── Flow 7: URL via yt-dlp ────────────────────────────────────────────────

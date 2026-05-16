@@ -16,6 +16,8 @@ internal sealed class TelegramService
     private readonly TelegramOptions _options;
     private readonly DownloadManifest _manifest;
     private readonly ILogger<TelegramService> _logger;
+    private readonly SemaphoreSlim _connectLock = new(1, 1);
+    private bool _connected;
 
     public TelegramService(
         Client client,
@@ -30,11 +32,22 @@ internal sealed class TelegramService
     }
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
-    public async Task ConnectAsync(CancellationToken ct)
+    public async Task EnsureConnectedAsync(CancellationToken ct)
     {
-        _logger.LogInformation("Connecting to Telegram…");
-        await _client.LoginUserIfNeeded().WaitAsync(ct);
-        _logger.LogInformation("Logged in as: {User}", _client.User);
+        if (_connected) return;
+        await _connectLock.WaitAsync(ct);
+        try
+        {
+            if (_connected) return;
+            _logger.LogInformation("Connecting to Telegram…");
+            await _client.LoginUserIfNeeded().WaitAsync(ct);
+            _logger.LogInformation("Logged in as: {User}", _client.User);
+            _connected = true;
+        }
+        finally
+        {
+            _connectLock.Release();
+        }
     }
 
     // ── Peer / chat resolution ────────────────────────────────────────────────

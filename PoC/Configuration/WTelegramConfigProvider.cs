@@ -12,7 +12,33 @@ internal sealed class WTelegramConfigProvider
     {
         _options = options.Value;
         _prompt = prompt;
+    }
 
+    public string? Provide(string what) => what switch
+    {
+        "api_id" => RequireApiId(),
+        "api_hash" => RequireApiHash(),
+        "phone_number" => _prompt.Ask("Phone number (international format, e.g. +998901234567): "),
+        "verification_code" => _prompt.Ask("Verification code from Telegram: "),
+        "password" => _prompt.Ask("2FA password (if enabled): "),
+        "session_pathname" => _options.ResolvedSessionPathname,
+        _ => null
+    };
+
+    private string RequireApiId()
+    {
+        EnsureConfigured();
+        return _options.ApiId.ToString();
+    }
+
+    private string RequireApiHash()
+    {
+        EnsureConfigured();
+        return _options.ApiHash;
+    }
+
+    private void EnsureConfigured()
+    {
         if (_options.ApiId == 0 || string.IsNullOrWhiteSpace(_options.ApiHash))
         {
             throw new InvalidOperationException(
@@ -21,15 +47,4 @@ internal sealed class WTelegramConfigProvider
                 "or appsettings.Local.json.");
         }
     }
-
-    public string? Provide(string what) => what switch
-    {
-        "api_id" => _options.ApiId.ToString(),
-        "api_hash" => _options.ApiHash,
-        "phone_number" => _prompt.Ask("Phone number (international format, e.g. +998901234567): "),
-        "verification_code" => _prompt.Ask("Verification code from Telegram: "),
-        "password" => _prompt.Ask("2FA password (if enabled): "),
-        "session_pathname" => _options.ResolvedSessionPathname,
-        _ => null
-    };
 }
