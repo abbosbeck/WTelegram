@@ -1,8 +1,12 @@
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using TelegramDownloader.Configuration;
 using TelegramDownloader.Helpers;
 using TelegramDownloader.Services;
+using TL;
+using WTelegram;
 
 namespace TelegramDownloader.Ui;
 
@@ -16,6 +20,9 @@ internal sealed class ConsoleUi : BackgroundService
     private readonly TelegramService _telegram;
     private readonly MessageLinkResolver _linkResolver;
     private readonly WebVideoDownloader _webDownloader;
+    private readonly SessionPool _sessionPool;
+    private readonly LoginCoordinator _loginCoordinator;
+    private readonly TelegramOptions _telegramOptions;
     private readonly IConsolePrompt _prompt;
     private readonly IHostApplicationLifetime _lifetime;
     private readonly ILogger<ConsoleUi> _logger;
@@ -24,6 +31,9 @@ internal sealed class ConsoleUi : BackgroundService
         TelegramService telegram,
         MessageLinkResolver linkResolver,
         WebVideoDownloader webDownloader,
+        SessionPool sessionPool,
+        LoginCoordinator loginCoordinator,
+        IOptions<TelegramOptions> telegramOptions,
         IConsolePrompt prompt,
         IHostApplicationLifetime lifetime,
         ILogger<ConsoleUi> logger)
@@ -31,6 +41,9 @@ internal sealed class ConsoleUi : BackgroundService
         _telegram = telegram;
         _linkResolver = linkResolver;
         _webDownloader = webDownloader;
+        _sessionPool = sessionPool;
+        _loginCoordinator = loginCoordinator;
+        _telegramOptions = telegramOptions.Value;
         _prompt = prompt;
         _lifetime = lifetime;
         _logger = logger;
@@ -42,10 +55,7 @@ internal sealed class ConsoleUi : BackgroundService
         {
             await RunMenuAsync(stoppingToken);
         }
-        catch (OperationCanceledException)
-        {
-            // graceful shutdown
-        }
+        catch (OperationCanceledException) { /* graceful shutdown */ }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Fatal error in console UI");
@@ -95,11 +105,79 @@ internal sealed class ConsoleUi : BackgroundService
         }
     }
 
+    // ── Owner Client acquisition (drives login state machine via console) ─────
+    private async Task<Client> GetOwnerClientAsync(CancellationToken ct)
+    {
+        if (_telegramOptions.OwnerUserId == 0)
+            throw new InvalidOperationException(
+                "Telegram:OwnerUserId is not configured. " +
+                "Set it to your numeric Telegram user ID (ask @userinfobot if you don't know it).");
+
+        var userId = _telegramOptions.OwnerUserId;
+        if (_sessionPool.IsCached(userId))
+            return await _sessionPool.AcquireAsync(userId, ct);
+
+        // Register a LoginSession so the SessionPool's config callback can ask
+        // the console for phone / code / 2FA password as WTelegramClient requests them.
+        var login = new LoginSession(userId, null!);
+        if (!_loginCoordinator.TryRegister(userId, login))
+            login = _loginCoordinator.Get(userId)!;
+
+        // Drive prompts in a side task so they're presented as soon as WTelegram asks.
+        _ = Task.Run(() => DrivePromptsAsync(login));
+
+        try
+        {
+            return await _sessionPool.AcquireAsync(userId, ct);
+        }
+        catch
+        {
+            _loginCoordinator.Cancel(userId);
+            throw;
+        }
+    }
+
+    private async Task DrivePromptsAsync(LoginSession login)
+    {
+        // WTelegramClient asks for these one by one. Each TCS only resolves once.
+        try
+        {
+            if (login.IsPhoneAwaited)
+            {
+                Console.WriteLine();
+                var phone = _prompt.Ask("Phone number (international format, e.g. +998901234567): ");
+                login.SubmitPhone(phone);
+            }
+            // Code prompt – wait a tick so the phone is processed and WTelegram requests the code next.
+            while (login.IsPhoneAwaited) await Task.Delay(100);
+            if (login.IsCodeAwaited)
+            {
+                Console.WriteLine();
+                Console.WriteLine("Telegram sent a verification code. " +
+                    "On a fresh device you'll find it in: Telegram app → Settings → Devices → the new session entry.");
+                var code = _prompt.Ask("Verification code: ");
+                login.SubmitCode(code);
+            }
+            while (login.IsCodeAwaited) await Task.Delay(100);
+            if (login.IsPasswordAwaited)
+            {
+                Console.WriteLine();
+                var pwd = _prompt.Ask("2FA password (leave blank if none): ");
+                login.SubmitPassword(pwd);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Login prompt driver failed");
+        }
+    }
+
     // ── Flow 1: scan history ──────────────────────────────────────────────────
     private async Task DownloadFromChatFlowAsync(CancellationToken ct)
     {
         var input = _prompt.Ask("\nEnter chat username or ID (e.g. @mychannel or 123456789): ");
-        var (peer, chatId) = await _telegram.ResolvePeerAsync(input, ct);
+        var client = await GetOwnerClientAsync(ct);
+        var (peer, chatId) = await _telegram.ResolvePeerAsync(client, input, ct);
 
         var limitStr = _prompt.Ask($"How many recent messages to scan? [default {DefaultMessageScanLimit}]: ");
         int limit = int.TryParse(limitStr, out var n) ? n : DefaultMessageScanLimit;
@@ -107,17 +185,17 @@ internal sealed class ConsoleUi : BackgroundService
         var kinds = AskMediaKinds();
 
         Console.WriteLine($"\nFetching last {limit} messages…");
-        var items = await _telegram.GetMediaAsync(peer, chatId, limit, kinds, ct);
+        var items = await _telegram.GetMediaAsync(client, peer, chatId, limit, kinds, ct);
 
-        await PromptAndDownloadAsync(items, ct);
+        await PromptAndDownloadAsync(client, items, ct);
     }
 
     // ── Flow 2: in-chat search ────────────────────────────────────────────────
     private async Task SearchAndDownloadFlowAsync(CancellationToken ct)
     {
         var input = _prompt.Ask("\nEnter chat username or ID: ");
-        await _telegram.EnsureConnectedAsync(ct);
-        var (peer, chatId) = await _telegram.ResolvePeerAsync(input, ct);
+        var client = await GetOwnerClientAsync(ct);
+        var (peer, chatId) = await _telegram.ResolvePeerAsync(client, input, ct);
 
         var query = _prompt.Ask("Search query (text to match in messages): ");
         var kinds = AskMediaKinds();
@@ -125,16 +203,17 @@ internal sealed class ConsoleUi : BackgroundService
         int limit = int.TryParse(limitStr, out var n) ? n : 100;
 
         Console.WriteLine($"\nSearching for \"{query}\"…");
-        var items = await _telegram.SearchMediaAsync(peer, chatId, query, kinds, limit, ct);
+        var items = await _telegram.SearchMediaAsync(client, peer, chatId, query, kinds, limit, ct);
 
-        await PromptAndDownloadAsync(items, ct);
+        await PromptAndDownloadAsync(client, items, ct);
     }
 
     // ── Flow 3: direct link ───────────────────────────────────────────────────
     private async Task DownloadByLinkFlowAsync(CancellationToken ct)
     {
         var link = _prompt.Ask("\nPaste t.me message link: ");
-        var (_, chatId, msg) = await _linkResolver.ResolveAsync(link, ct);
+        var client = await GetOwnerClientAsync(ct);
+        var (_, chatId, msg) = await _linkResolver.ResolveAsync(client, link, ct);
 
         var item = MediaItem.TryFrom(chatId, msg);
         if (item is null)
@@ -144,41 +223,41 @@ internal sealed class ConsoleUi : BackgroundService
         }
 
         Console.WriteLine($"Found: [{item.Kind}] {item.DisplayName} ({FileHelpers.FormatSize(item.Size)})");
-        await DownloadListAsync(new[] { item }, ct);
+        await DownloadListAsync(client, new[] { item }, ct);
     }
 
     // ── Flow 5: active stories ────────────────────────────────────────────────
     private async Task DownloadActiveStoriesFlowAsync(CancellationToken ct)
     {
         var input = _prompt.Ask("\nEnter user/channel username or ID: ");
-        await _telegram.EnsureConnectedAsync(ct);
-        var (peer, peerId) = await _telegram.ResolvePeerAsync(input, ct);
+        var client = await GetOwnerClientAsync(ct);
+        var (peer, peerId) = await _telegram.ResolvePeerAsync(client, input, ct);
 
         Console.WriteLine("\nFetching active stories…");
-        var items = await _telegram.GetActiveStoriesAsync(peer, peerId, AllKinds, ct);
-        await PromptAndDownloadAsync(items, ct);
+        var items = await _telegram.GetActiveStoriesAsync(client, peer, peerId, AllKinds, ct);
+        await PromptAndDownloadAsync(client, items, ct);
     }
 
     // ── Flow 6: pinned stories ────────────────────────────────────────────────
     private async Task DownloadPinnedStoriesFlowAsync(CancellationToken ct)
     {
         var input = _prompt.Ask("\nEnter user/channel username or ID: ");
-        await _telegram.EnsureConnectedAsync(ct);
-        var (peer, peerId) = await _telegram.ResolvePeerAsync(input, ct);
+        var client = await GetOwnerClientAsync(ct);
+        var (peer, peerId) = await _telegram.ResolvePeerAsync(client, input, ct);
 
         var limitStr = _prompt.Ask("How many pinned stories to fetch? [default 50]: ");
         int limit = int.TryParse(limitStr, out var n) ? n : 50;
 
         Console.WriteLine($"\nFetching up to {limit} pinned stories…");
-        var items = await _telegram.GetPinnedStoriesAsync(peer, peerId, limit, AllKinds, ct);
-        await PromptAndDownloadAsync(items, ct);
+        var items = await _telegram.GetPinnedStoriesAsync(client, peer, peerId, limit, AllKinds, ct);
+        await PromptAndDownloadAsync(client, items, ct);
     }
 
-    // ── Flow 4: list chats ─────────────────────────────────────────────────────
+    // ── Flow 4: list chats ────────────────────────────────────────────────────
     private async Task ListChatsFlowAsync(CancellationToken ct)
     {
-        await _telegram.EnsureConnectedAsync(ct);
-        await _telegram.ListChatsAsync(ct);
+        var client = await GetOwnerClientAsync(ct);
+        await _telegram.ListChatsAsync(client, ct);
     }
 
     // ── Flow 7: URL via yt-dlp ────────────────────────────────────────────────
@@ -208,7 +287,7 @@ internal sealed class ConsoleUi : BackgroundService
     }
 
     // ── Shared selection + dispatch ───────────────────────────────────────────
-    private async Task PromptAndDownloadAsync(IReadOnlyList<MediaItem> items, CancellationToken ct)
+    private async Task PromptAndDownloadAsync(Client client, IReadOnlyList<MediaItem> items, CancellationToken ct)
     {
         if (items.Count == 0)
         {
@@ -231,15 +310,15 @@ internal sealed class ConsoleUi : BackgroundService
         var indices = ParseSelection(sel, items.Count).ToList();
         var selected = indices.Select(i => items[i]).ToList();
 
-        await DownloadListAsync(selected, ct);
+        await DownloadListAsync(client, selected, ct);
     }
 
-    private async Task DownloadListAsync(IReadOnlyList<MediaItem> selected, CancellationToken ct)
+    private async Task DownloadListAsync(Client client, IReadOnlyList<MediaItem> selected, CancellationToken ct)
     {
         if (selected.Count == 0) return;
 
         Console.WriteLine($"\nStarting {selected.Count} download(s)…\n");
-        int skipped = await _telegram.DownloadManyAsync(selected,
+        int skipped = await _telegram.DownloadManyAsync(client, selected,
             onCompleted: (done, total) =>
             {
                 Console.Write($"\r  progress: {done}/{total} completed   ");

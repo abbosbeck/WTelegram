@@ -11,6 +11,13 @@ internal sealed class TelegramOptions
     public string ManifestFileName { get; set; } = ".downloaded.json";
     public int MaxConcurrentDownloads { get; set; } = 3;
 
+    /// <summary>
+    /// Telegram numeric user ID of the operator (you). The console UI uses this
+    /// to identify which session in Postgres to drive. Required if you want to
+    /// use any Telegram-backed console flow.
+    /// </summary>
+    public long OwnerUserId { get; set; }
+
     public string ResolvedOutputDirectory =>
         string.IsNullOrWhiteSpace(OutputDirectory)
             ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "TelegramDownloads")

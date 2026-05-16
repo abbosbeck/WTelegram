@@ -12,14 +12,8 @@ namespace TelegramDownloader.Services;
 /// </summary>
 internal sealed partial class MessageLinkResolver
 {
-    private readonly Client _client;
-
-    public MessageLinkResolver(Client client)
-    {
-        _client = client;
-    }
-
-    public async Task<(InputPeer Peer, long ChatId, Message Message)> ResolveAsync(string link, CancellationToken ct)
+    public async Task<(InputPeer Peer, long ChatId, Message Message)> ResolveAsync(
+        Client client, string link, CancellationToken ct)
     {
         var publicMatch = PublicLinkRegex().Match(link);
         if (publicMatch.Success)
@@ -27,7 +21,7 @@ internal sealed partial class MessageLinkResolver
             var username = publicMatch.Groups["user"].Value;
             var msgId = int.Parse(publicMatch.Groups["id"].Value);
 
-            var resolved = await _client.Contacts_ResolveUsername(username).WaitAsync(ct);
+            var resolved = await client.Contacts_ResolveUsername(username).WaitAsync(ct);
             var peer = resolved.peer switch
             {
                 PeerChannel c => resolved.chats[c.channel_id].ToInputPeer(),
@@ -36,7 +30,7 @@ internal sealed partial class MessageLinkResolver
                 _ => throw new InvalidOperationException("Unknown peer type.")
             };
 
-            var msg = await FetchMessageAsync(peer, msgId, ct);
+            var msg = await FetchMessageAsync(client, peer, msgId, ct);
             return (peer, PeerIdFromInput(peer), msg);
         }
 
@@ -46,24 +40,24 @@ internal sealed partial class MessageLinkResolver
             long internalId = long.Parse(privateMatch.Groups["chan"].Value);
             int msgId = int.Parse(privateMatch.Groups["id"].Value);
 
-            var dialogs = await _client.Messages_GetAllDialogs().WaitAsync(ct);
+            var dialogs = await client.Messages_GetAllDialogs().WaitAsync(ct);
             if (!dialogs.chats.TryGetValue(internalId, out var chat))
                 throw new InvalidOperationException(
                     $"Channel {internalId} not found in your dialogs. Join the chat first.");
 
             var peer = chat.ToInputPeer();
-            var msg = await FetchMessageAsync(peer, msgId, ct);
+            var msg = await FetchMessageAsync(client, peer, msgId, ct);
             return (peer, internalId, msg);
         }
 
         throw new InvalidOperationException($"Not a valid t.me message link: {link}");
     }
 
-    private async Task<Message> FetchMessageAsync(InputPeer peer, int msgId, CancellationToken ct)
+    private static async Task<Message> FetchMessageAsync(Client client, InputPeer peer, int msgId, CancellationToken ct)
     {
         Messages_MessagesBase result = peer is InputPeerChannel ipc
-            ? await _client.Channels_GetMessages(new InputChannel(ipc.channel_id, ipc.access_hash), msgId).WaitAsync(ct)
-            : await _client.Messages_GetMessages(msgId).WaitAsync(ct);
+            ? await client.Channels_GetMessages(new InputChannel(ipc.channel_id, ipc.access_hash), msgId).WaitAsync(ct)
+            : await client.Messages_GetMessages(msgId).WaitAsync(ct);
 
         var msg = result.Messages.OfType<Message>().FirstOrDefault(m => m.ID == msgId)
                   ?? throw new InvalidOperationException($"Message {msgId} not found or inaccessible.");

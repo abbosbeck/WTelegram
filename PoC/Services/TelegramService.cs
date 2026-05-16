@@ -8,54 +8,34 @@ using WTelegram;
 
 namespace TelegramDownloader.Services;
 
+/// <summary>
+/// Pure Telegram operations. Stateless – the caller supplies the per-user
+/// <see cref="Client"/> via <see cref="SessionPool.AcquireAsync"/>.
+/// </summary>
 internal sealed class TelegramService
 {
     private const int FileBufferSize = 1 << 20;
 
-    private readonly Client _client;
     private readonly TelegramOptions _options;
     private readonly DownloadManifest _manifest;
     private readonly ILogger<TelegramService> _logger;
-    private readonly SemaphoreSlim _connectLock = new(1, 1);
-    private bool _connected;
 
     public TelegramService(
-        Client client,
         IOptions<TelegramOptions> options,
         DownloadManifest manifest,
         ILogger<TelegramService> logger)
     {
-        _client = client;
         _options = options.Value;
         _manifest = manifest;
         _logger = logger;
     }
 
-    // ── Lifecycle ─────────────────────────────────────────────────────────────
-    public async Task EnsureConnectedAsync(CancellationToken ct)
-    {
-        if (_connected) return;
-        await _connectLock.WaitAsync(ct);
-        try
-        {
-            if (_connected) return;
-            _logger.LogInformation("Connecting to Telegram…");
-            await _client.LoginUserIfNeeded().WaitAsync(ct);
-            _logger.LogInformation("Logged in as: {User}", _client.User);
-            _connected = true;
-        }
-        finally
-        {
-            _connectLock.Release();
-        }
-    }
-
     // ── Peer / chat resolution ────────────────────────────────────────────────
-    public async Task<(InputPeer Peer, long ChatId)> ResolvePeerAsync(string input, CancellationToken ct)
+    public async Task<(InputPeer Peer, long ChatId)> ResolvePeerAsync(Client client, string input, CancellationToken ct)
     {
         if (long.TryParse(input, out var numId))
         {
-            var contacts = await _client.Messages_GetAllDialogs().WaitAsync(ct);
+            var contacts = await client.Messages_GetAllDialogs().WaitAsync(ct);
             if (contacts.chats.TryGetValue(numId, out var chat))
                 return (chat.ToInputPeer(), numId);
             if (contacts.users.TryGetValue(numId, out var user))
@@ -64,7 +44,7 @@ internal sealed class TelegramService
         }
 
         var username = input.TrimStart('@');
-        var resolved = await _client.Contacts_ResolveUsername(username).WaitAsync(ct);
+        var resolved = await client.Contacts_ResolveUsername(username).WaitAsync(ct);
         return resolved.peer switch
         {
             PeerChannel c => (resolved.chats[c.channel_id].ToInputPeer(), c.channel_id),
@@ -74,10 +54,10 @@ internal sealed class TelegramService
         };
     }
 
-    public async Task ListChatsAsync(CancellationToken ct)
+    public async Task ListChatsAsync(Client client, CancellationToken ct)
     {
         Console.WriteLine("\nLoading dialogs…");
-        var dialogs = await _client.Messages_GetAllDialogs().WaitAsync(ct);
+        var dialogs = await client.Messages_GetAllDialogs().WaitAsync(ct);
 
         Console.WriteLine($"\n{"ID",-15} {"Type",-10} {"Title"}");
         Console.WriteLine(new string('─', 60));
@@ -105,33 +85,33 @@ internal sealed class TelegramService
 
     // ── Media discovery ───────────────────────────────────────────────────────
     public async Task<IReadOnlyList<MediaItem>> GetMediaAsync(
-        InputPeer peer, long chatId, int limit, IReadOnlySet<MediaKind> kinds, CancellationToken ct)
+        Client client, InputPeer peer, long chatId, int limit, IReadOnlySet<MediaKind> kinds, CancellationToken ct)
     {
-        var messages = await _client.Messages_GetHistory(peer, limit: limit).WaitAsync(ct);
+        var messages = await client.Messages_GetHistory(peer, limit: limit).WaitAsync(ct);
         return ExtractMedia(messages.Messages, chatId, kinds);
     }
 
     public async Task<IReadOnlyList<MediaItem>> SearchMediaAsync(
-        InputPeer peer, long chatId, string query, IReadOnlySet<MediaKind> kinds, int limit, CancellationToken ct)
+        Client client, InputPeer peer, long chatId, string query, IReadOnlySet<MediaKind> kinds, int limit, CancellationToken ct)
     {
-        var result = await _client.Messages_Search(peer, query, limit: limit).WaitAsync(ct);
+        var result = await client.Messages_Search(peer, query, limit: limit).WaitAsync(ct);
         return ExtractMedia(result.Messages, chatId, kinds);
     }
 
     // ── Stories ───────────────────────────────────────────────────────────────
     public async Task<IReadOnlyList<MediaItem>> GetActiveStoriesAsync(
-        InputPeer peer, long peerId, IReadOnlySet<MediaKind> kinds, CancellationToken ct)
+        Client client, InputPeer peer, long peerId, IReadOnlySet<MediaKind> kinds, CancellationToken ct)
     {
-        var result = await _client.Stories_GetPeerStories(peer).WaitAsync(ct);
+        var result = await client.Stories_GetPeerStories(peer).WaitAsync(ct);
         var raw = result.stories?.stories;
         _logger.LogInformation("Stories_GetPeerStories returned {Count} story item(s)", raw?.Length ?? 0);
         return ExtractStories(raw, peerId, kinds);
     }
 
     public async Task<IReadOnlyList<MediaItem>> GetPinnedStoriesAsync(
-        InputPeer peer, long peerId, int limit, IReadOnlySet<MediaKind> kinds, CancellationToken ct)
+        Client client, InputPeer peer, long peerId, int limit, IReadOnlySet<MediaKind> kinds, CancellationToken ct)
     {
-        var result = await _client.Stories_GetPinnedStories(peer, limit: limit).WaitAsync(ct);
+        var result = await client.Stories_GetPinnedStories(peer, limit: limit).WaitAsync(ct);
         _logger.LogInformation("Stories_GetPinnedStories returned {Count} story item(s)", result.stories?.Length ?? 0);
         return ExtractStories(result.stories, peerId, kinds);
     }
@@ -170,6 +150,7 @@ internal sealed class TelegramService
 
     // ── Download ──────────────────────────────────────────────────────────────
     public async Task<int> DownloadManyAsync(
+        Client client,
         IReadOnlyList<MediaItem> items,
         Action<int, int> onCompleted,
         CancellationToken ct)
@@ -198,7 +179,7 @@ internal sealed class TelegramService
             try
             {
                 bool silent = parallel > 1;
-                await DownloadMediaAsync(item, silent, token);
+                await DownloadMediaAsync(client, item, silent, token);
             }
             catch (OperationCanceledException) { throw; }
             catch (Exception ex)
@@ -213,7 +194,7 @@ internal sealed class TelegramService
         return skipped;
     }
 
-    public async Task DownloadMediaAsync(MediaItem item, bool silentProgress, CancellationToken ct)
+    public async Task DownloadMediaAsync(Client client, MediaItem item, bool silentProgress, CancellationToken ct)
     {
         var outputDir = _options.ResolvedOutputDirectory;
         Directory.CreateDirectory(outputDir);
@@ -242,11 +223,11 @@ internal sealed class TelegramService
 
             if (item.Document is not null)
             {
-                await _client.DownloadFileAsync(item.Document, fs, progress: cb).WaitAsync(ct);
+                await client.DownloadFileAsync(item.Document, fs, progress: cb).WaitAsync(ct);
             }
             else if (item.Photo is not null)
             {
-                await _client.DownloadFileAsync(item.Photo, fs, progress: cb).WaitAsync(ct);
+                await client.DownloadFileAsync(item.Photo, fs, progress: cb).WaitAsync(ct);
             }
             else
             {
