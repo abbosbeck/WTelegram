@@ -107,7 +107,11 @@ internal sealed class WebVideoDownloader
             overrideOptions.Cookies = _options.CookiesPath;
 
         var progress = new Progress<DownloadProgress>(PrintProgress);
-        var output = new Progress<string>(line => _logger.LogDebug("yt-dlp: {Line}", line));
+        var output = new Progress<string>(line =>
+        {
+            if (!string.IsNullOrWhiteSpace(line))
+                _logger.LogInformation("yt-dlp: {Line}", line);
+        });
 
         _logger.LogInformation("Starting yt-dlp download: {Url}", url);
 
@@ -129,15 +133,24 @@ internal sealed class WebVideoDownloader
         return path;
     }
 
-    private static DownloadProgress _lastProgress = default!;
     private static void PrintProgress(DownloadProgress p)
     {
-        _lastProgress = p;
+        var state = p.State.ToString();
         var pct = p.Progress * 100;
-        var bars = (int)(pct / 2);
-        string bar = $"[{new string('█', bars)}{new string('░', 50 - bars)}]";
-        var speed = p.DownloadSpeed ?? "";
-        var eta = p.ETA ?? "";
-        Console.Write($"\r  {bar} {pct,5:F1}%  {speed}  ETA {eta}   ");
+        var speed = string.IsNullOrWhiteSpace(p.DownloadSpeed) ? "" : $"  {p.DownloadSpeed}";
+        var eta = string.IsNullOrWhiteSpace(p.ETA) ? "" : $"  ETA {p.ETA}";
+
+        // yt-dlp doesn't always emit a parseable percentage (HLS/DASH, post-processing,
+        // multi-stream muxing). Only draw the bar when we actually have a value
+        if (pct > 0)
+        {
+            int bars = (int)(pct / 2);
+            string bar = $"[{new string('█', bars)}{new string('░', 50 - bars)}]";
+            Console.Write($"\r  {bar} {pct,5:F1}%  {state,-15}{speed}{eta}   ");
+        }
+        else
+        {
+            Console.Write($"\r  {state,-15}{speed}{eta}                                   ");
+        }
     }
 }
