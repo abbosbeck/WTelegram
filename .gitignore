@@ -369,3 +369,6 @@ telegram_session*
 # Local config overrides
 appsettings.Development.json
 appsettings.Local.json
+
+# Local-only architectural decisions / scratch notes
+docs/DECISIONS.md
