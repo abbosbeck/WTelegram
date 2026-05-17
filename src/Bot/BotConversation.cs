@@ -45,11 +45,11 @@ internal enum LoginStep
 internal enum PendingAction
 {
     None,
-    AwaitingByLink,
+    /// <summary>User asked for the unified download flow; classify Telegram vs web on the next message.</summary>
+    AwaitingDownloadLink,
     AwaitingChatTarget,
     AwaitingSearchTarget,
     AwaitingSearchQuery,
     AwaitingStoriesTarget,
     AwaitingStoriesPinnedTarget,
-    AwaitingUrl,
 }

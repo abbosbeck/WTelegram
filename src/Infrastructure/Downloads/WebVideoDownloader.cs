@@ -61,7 +61,7 @@ public sealed class WebVideoDownloader
 
             if (!File.Exists(ffmpegPath))
             {
-                _logger.LogInformation("Downloading ffmpeg into {Dir}…", toolsDir);
+                _logger.LogInformation("Downloading ffmpeg into {Dir} (this is a one-time ~80MB download)…", toolsDir);
                 await Utils.DownloadFFmpeg(toolsDir);
             }
 
@@ -81,6 +81,23 @@ public sealed class WebVideoDownloader
         finally
         {
             _initLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Pre-warms yt-dlp and ffmpeg in the background so user-facing /url
+    /// requests don't pay the (potentially multi-minute) one-time download cost.
+    /// Safe to call multiple times; safe to fire-and-forget.
+    /// </summary>
+    public async Task WarmupAsync(CancellationToken ct)
+    {
+        try
+        {
+            await EnsureReadyAsync(ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "yt-dlp/ffmpeg warmup failed; will retry on first user request");
         }
     }
 

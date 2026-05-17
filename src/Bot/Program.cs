@@ -59,6 +59,11 @@ internal static class Program
         var wtLogger = host.Services.GetRequiredService<ILoggerFactory>().CreateLogger("WTelegram");
         WTelegram.Helpers.Log = (level, message) => wtLogger.Log((LogLevel)level, "{Message}", message);
 
+        // Pre-warm yt-dlp + ffmpeg in the background so the first /url request
+        // doesn't pay the cold-start download cost (ffmpeg is ~80 MB).
+        var webDownloader = host.Services.GetRequiredService<Infrastructure.Downloads.WebVideoDownloader>();
+        _ = Task.Run(() => webDownloader.WarmupAsync(CancellationToken.None));
+
         await host.RunAsync();
         return 0;
     }

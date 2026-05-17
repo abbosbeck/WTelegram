@@ -628,12 +628,10 @@ internal sealed class BotUpdateHandler : BackgroundService
         var parts = text.Split(' ', 2, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
         if (parts.Length < 2)
         {
-            // No URL provided — enter conversation mode so the next plain text is the URL.
+            // No URL provided — reuse the unified download-by-link flow.
             convo.ClearPending();
-            convo.Pending = PendingAction.AwaitingUrl;
-            await _bot.SendMessage(convo.ChatId,
-                "Send the link (YouTube, TikTok, Instagram, …). I'll show available qualities.",
-                cancellationToken: ct);
+            convo.Pending = PendingAction.AwaitingDownloadLink;
+            await PromptForDownloadLinkAsync(convo, ct);
             return;
         }
         await StartUrlFlowAsync(convo, parts[1], ct);
@@ -934,6 +932,14 @@ internal sealed class BotUpdateHandler : BackgroundService
                     await SafeEditAsync(chatId, cb.Message.MessageId, "Cancelled.", ct);
                     return;
 
+                // Cancel from the unified "Download by link" prompt.
+                case "dlx" when parts.Length == 1:
+                    convo.ClearPending();
+                    await _bot.AnswerCallbackQuery(cb.Id, "Cancelled", cancellationToken: ct);
+                    await SafeEditAsync(chatId, cb.Message.MessageId, "Cancelled.", ct);
+                    await SendMenuAsync(chatId, "What would you like to do?", ct);
+                    return;
+
                 default:
                     await _bot.AnswerCallbackQuery(cb.Id, cancellationToken: ct);
                     return;
@@ -1065,13 +1071,12 @@ internal sealed class BotUpdateHandler : BackgroundService
     {
         var rows = new InlineKeyboardButton[][]
         {
-            [InlineKeyboardButton.WithCallbackData("📥 By link",        "m:bylink"),
-             InlineKeyboardButton.WithCallbackData("▶️ From chat",      "m:chat")],
-            [InlineKeyboardButton.WithCallbackData("🔍 Search",         "m:search"),
-             InlineKeyboardButton.WithCallbackData("📖 Stories",        "m:stories")],
-            [InlineKeyboardButton.WithCallbackData("📖 Pinned stories", "m:pstories"),
-             InlineKeyboardButton.WithCallbackData("🌐 URL download",   "m:url")],
-            [InlineKeyboardButton.WithCallbackData("📊 Status",         "m:status")],
+            [InlineKeyboardButton.WithCallbackData("📥 Download by link", "m:dl")],
+            [InlineKeyboardButton.WithCallbackData("▶️ From chat",         "m:chat"),
+             InlineKeyboardButton.WithCallbackData("🔍 Search",            "m:search")],
+            [InlineKeyboardButton.WithCallbackData("📖 Stories",            "m:stories"),
+             InlineKeyboardButton.WithCallbackData("📖 Pinned stories",     "m:pstories")],
+            [InlineKeyboardButton.WithCallbackData("📊 Status",             "m:status")],
         };
         try
         {
@@ -1085,15 +1090,15 @@ internal sealed class BotUpdateHandler : BackgroundService
     private async Task HandleMenuButtonAsync(BotConversation convo, string action, int menuMessageId, CancellationToken ct)
     {
         // Sub-flows that need a session must verify it first.
-        bool needsLogin = action is "bylink" or "chat" or "search" or "stories" or "pstories" or "url";
+        bool needsLogin = action is "dl" or "chat" or "search" or "stories" or "pstories";
         if (needsLogin && !await RequireLoginAsync(convo, ct)) return;
 
         switch (action)
         {
-            case "bylink":
+            case "dl":
                 convo.ClearPending();
-                convo.Pending = PendingAction.AwaitingByLink;
-                await _bot.SendMessage(convo.ChatId, "Send the t.me link.", cancellationToken: ct);
+                convo.Pending = PendingAction.AwaitingDownloadLink;
+                await PromptForDownloadLinkAsync(convo, ct);
                 return;
 
             case "chat":
@@ -1125,18 +1130,23 @@ internal sealed class BotUpdateHandler : BackgroundService
                 await _bot.SendMessage(convo.ChatId, "Send the user/channel for pinned stories.", cancellationToken: ct);
                 return;
 
-            case "url":
-                convo.ClearPending();
-                convo.Pending = PendingAction.AwaitingUrl;
-                await _bot.SendMessage(convo.ChatId,
-                    "Send the link (YouTube, TikTok, Instagram, …). I'll show available qualities.",
-                    cancellationToken: ct);
-                return;
-
             case "status":
                 await HandleStatusAsync(convo, ct);
                 return;
         }
+    }
+
+    private async Task PromptForDownloadLinkAsync(BotConversation convo, CancellationToken ct)
+    {
+        var kb = new InlineKeyboardMarkup(
+            [[InlineKeyboardButton.WithCallbackData("✖ Cancel", "dlx")]]);
+        await _bot.SendMessage(convo.ChatId,
+            "Send the link.\n" +
+            "• Telegram messages: <code>https://t.me/somechannel/123</code> or <code>@somechannel/123</code>\n" +
+            "• Anywhere else: any <code>http(s)://…</code> URL (YouTube, TikTok, Instagram, …)",
+            parseMode: ParseMode.Html,
+            replyMarkup: kb,
+            cancellationToken: ct);
     }
 
     /// <summary>
@@ -1150,9 +1160,8 @@ internal sealed class BotUpdateHandler : BackgroundService
 
         switch (pending)
         {
-            case PendingAction.AwaitingByLink:
-                convo.ClearPending();
-                await HandleByLinkAsync(convo, $"/by_link {text}", ct);
+            case PendingAction.AwaitingDownloadLink:
+                await DispatchDownloadLinkAsync(convo, text, ct);
                 return true;
 
             case PendingAction.AwaitingChatTarget:
@@ -1184,13 +1193,44 @@ internal sealed class BotUpdateHandler : BackgroundService
                 await HandleStoriesAsync(convo, $"/stories {text} pinned", ct);
                 return true;
 
-            case PendingAction.AwaitingUrl:
-                convo.ClearPending();
-                await StartUrlFlowAsync(convo, text, ct);
-                return true;
-
             default:
                 return false;
+        }
+    }
+
+    /// <summary>
+    /// Classifies the user's link and dispatches to the Telegram or web flow.
+    /// On an invalid link we keep <see cref="PendingAction.AwaitingDownloadLink"/>
+    /// active so the user can just send another link without re-tapping the menu.
+    /// </summary>
+    private async Task DispatchDownloadLinkAsync(BotConversation convo, string text, CancellationToken ct)
+    {
+        var result = LinkClassifier.Classify(text);
+        switch (result.Kind)
+        {
+            case LinkKind.Telegram:
+                convo.ClearPending();
+                await HandleByLinkAsync(convo, $"/by_link {result.Normalized}", ct);
+                return;
+
+            case LinkKind.Web:
+                convo.ClearPending();
+                await StartUrlFlowAsync(convo, result.Normalized, ct);
+                return;
+
+            default:
+                // Re-prompt; keep pending state so the next text is tried again.
+                var kb = new InlineKeyboardMarkup(
+                    [[InlineKeyboardButton.WithCallbackData("✖ Cancel", "dlx")]]);
+                await _bot.SendMessage(convo.ChatId,
+                    "That doesn't look like a valid link.\n" +
+                    "• Telegram messages: <code>https://t.me/somechannel/123</code> or <code>@somechannel/123</code>\n" +
+                    "• Anywhere else: any <code>http(s)://…</code> URL\n\n" +
+                    "Send another link, or tap Cancel to go back.",
+                    parseMode: ParseMode.Html,
+                    replyMarkup: kb,
+                    cancellationToken: ct);
+                return;
         }
     }
 
