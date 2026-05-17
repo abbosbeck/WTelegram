@@ -33,6 +33,7 @@ internal sealed class BotUpdateHandler : BackgroundService
     private readonly WebVideoDownloader _webDownloader;
     private readonly BotMediaSender _sender;
     private readonly MediaSelectionCache _selections;
+    private readonly PendingActionCache _pending;
     private readonly TelegramOptions _telegramOptions;
     private readonly ILogger<BotUpdateHandler> _logger;
 
@@ -50,6 +51,7 @@ internal sealed class BotUpdateHandler : BackgroundService
         WebVideoDownloader webDownloader,
         BotMediaSender sender,
         MediaSelectionCache selections,
+        PendingActionCache pending,
         IOptions<TelegramOptions> telegramOptions,
         ILogger<BotUpdateHandler> logger)
     {
@@ -62,6 +64,7 @@ internal sealed class BotUpdateHandler : BackgroundService
         _webDownloader = webDownloader;
         _sender = sender;
         _selections = selections;
+        _pending = pending;
         _telegramOptions = telegramOptions.Value;
         _logger = logger;
     }
@@ -71,6 +74,24 @@ internal sealed class BotUpdateHandler : BackgroundService
         var me = await _bot.GetMe(stoppingToken);
         _botUsername = me.Username;
         _logger.LogInformation("Bot started as @{Username} (id {Id})", me.Username, me.Id);
+
+        // Populate the "/" command menu in every Telegram client.
+        try
+        {
+            await _bot.SetMyCommands(new Telegram.Bot.Types.BotCommand[]
+            {
+                new() { Command = "menu",   Description = "Open the action menu" },
+                new() { Command = "login",  Description = "Sign in to your Telegram account" },
+                new() { Command = "status", Description = "Show your session state" },
+                new() { Command = "logout", Description = "Forget your stored session" },
+                new() { Command = "cancel", Description = "Cancel the current operation" },
+                new() { Command = "help",   Description = "Show command reference" },
+            }, cancellationToken: stoppingToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "SetMyCommands failed; \"/\" menu may be stale.");
+        }
 
         var receiverOptions = new ReceiverOptions
         {
@@ -111,6 +132,9 @@ internal sealed class BotUpdateHandler : BackgroundService
                 switch (cmd)
                 {
                     case "/start":
+                    case "/menu":
+                        await HandleMenuAsync(convo, ct);
+                        return;
                     case "/help":
                         await SendHelpAsync(chatId, ct);
                         return;
@@ -143,17 +167,49 @@ internal sealed class BotUpdateHandler : BackgroundService
                         return;
                     default:
                         await _bot.SendMessage(chatId,
-                            "Unknown command. Try /login, /by_link, /url, /chat, /search, /stories, /cancel, /logout, /status, /help.",
+                            "Unknown command. Try /menu or /help.",
                             cancellationToken: ct);
                         return;
                 }
             }
 
-            // Plain text — interpret per current login step.
+            // Plain text — dispatch to a pending menu-driven action first,
+            // then fall back to the login state machine.
+            if (await TryHandlePendingAsync(convo, text, message.MessageId, ct))
+                return;
             await HandleLoginInputAsync(convo, text, message.MessageId, ct);
+        }
+        catch (SessionExpiredException)
+        {
+            convo.ClearPending();
+            convo.Step = LoginStep.Idle;
+            convo.Login = null;
+            try
+            {
+                await _bot.SendMessage(chatId,
+                    "⚠️ Your Telegram session is no longer valid (revoked, password changed, or expired).\n\n" +
+                    "Send /login to sign in again.",
+                    cancellationToken: ct);
+            }
+            catch { /* ignore */ }
         }
         catch (Exception ex)
         {
+            // Some libraries wrap our exception; check inner chain too.
+            if (FindInner<SessionExpiredException>(ex) is not null)
+            {
+                convo.ClearPending();
+                convo.Step = LoginStep.Idle;
+                convo.Login = null;
+                try
+                {
+                    await _bot.SendMessage(chatId,
+                        "⚠️ Your Telegram session is no longer valid.\n\nSend /login to sign in again.",
+                        cancellationToken: ct);
+                }
+                catch { /* ignore */ }
+                return;
+            }
             _logger.LogError(ex, "Error handling update for chat {ChatId}", chatId);
             try
             {
@@ -162,7 +218,15 @@ internal sealed class BotUpdateHandler : BackgroundService
                     cancellationToken: ct);
             }
             catch { /* ignore secondary failures */ }
+            await SendMenuAsync(chatId, "What would you like to do next?", ct);
         }
+    }
+
+    private static T? FindInner<T>(Exception? ex) where T : Exception
+    {
+        for (var e = ex; e is not null; e = e.InnerException)
+            if (e is T t) return t;
+        return null;
     }
 
     private Task HandleErrorAsync(ITelegramBotClient bot, Exception ex, CancellationToken ct)
@@ -366,19 +430,26 @@ internal sealed class BotUpdateHandler : BackgroundService
         {
             _logger.LogWarning(ex, "Failed to send login result to chat {ChatId}", convo.ChatId);
         }
+        await SendMenuAsync(convo.ChatId, "What would you like to do next?", CancellationToken.None);
     }
 
     private async Task HandleCancelAsync(BotConversation convo, CancellationToken ct)
     {
-        if (convo.Step == LoginStep.Idle && convo.Login is null)
+        var hadLogin = convo.Step != LoginStep.Idle || convo.Login is not null;
+        var hadPending = convo.Pending != PendingAction.None;
+        if (!hadLogin && !hadPending)
         {
             await _bot.SendMessage(convo.ChatId, "Nothing to cancel.", cancellationToken: ct);
             return;
         }
-        _loginCoordinator.Cancel(convo.UserId);
-        convo.Step = LoginStep.Idle;
-        convo.Login = null;
-        await _bot.SendMessage(convo.ChatId, "Login cancelled.", cancellationToken: ct);
+        if (hadLogin)
+        {
+            _loginCoordinator.Cancel(convo.UserId);
+            convo.Step = LoginStep.Idle;
+            convo.Login = null;
+        }
+        convo.ClearPending();
+        await _bot.SendMessage(convo.ChatId, "Cancelled.", cancellationToken: ct);
     }
 
     private async Task HandleLogoutAsync(BotConversation convo, CancellationToken ct)
@@ -390,6 +461,7 @@ internal sealed class BotUpdateHandler : BackgroundService
         await _bot.SendMessage(convo.ChatId,
             "Signed out. Your encrypted session has been removed from the database.",
             cancellationToken: ct);
+        await SendMenuAsync(convo.ChatId, "What would you like to do next?", ct);
     }
 
     private async Task HandleStatusAsync(BotConversation convo, CancellationToken ct)
@@ -438,9 +510,10 @@ internal sealed class BotUpdateHandler : BackgroundService
                 ct);
 
             await _bot.DeleteMessage(convo.ChatId, status.MessageId, ct);
+            await SendMenuAsync(convo.ChatId, "Done. What's next?", ct);
         }
         catch (OperationCanceledException) { throw; }
-        catch (Exception ex)
+        catch (Exception ex) when (FindInner<SessionExpiredException>(ex) is null)
         {
             _logger.LogError(ex, "Forward by link failed for user {UserId}", convo.UserId);
             try
@@ -449,6 +522,7 @@ internal sealed class BotUpdateHandler : BackgroundService
                     $"Failed: {ex.Message}", cancellationToken: ct);
             }
             catch { /* ignore */ }
+            await SendMenuAsync(convo.ChatId, "What would you like to do next?", ct);
         }
     }
 
@@ -484,33 +558,91 @@ internal sealed class BotUpdateHandler : BackgroundService
 
     private async Task HandleUrlAsync(BotConversation convo, string text, CancellationToken ct)
     {
-        var parts = text.Split(' ', 3, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var parts = text.Split(' ', 2, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
         if (parts.Length < 2)
         {
+            // No URL provided — enter conversation mode so the next plain text is the URL.
+            convo.ClearPending();
+            convo.Pending = PendingAction.AwaitingUrl;
             await _bot.SendMessage(convo.ChatId,
-                "Usage: /url <link> [audio]\nExamples:\n  /url https://youtu.be/abc\n  /url https://youtu.be/abc audio",
+                "Send the link (YouTube, TikTok, Instagram, …). I'll show available qualities.",
                 cancellationToken: ct);
             return;
         }
-        var url = parts[1];
-        var audioOnly = parts.Length == 3 && parts[2].StartsWith("a", StringComparison.OrdinalIgnoreCase);
-        var urlKey = audioOnly ? $"audio:{url}" : $"video:{url}";
+        await StartUrlFlowAsync(convo, parts[1], ct);
+    }
 
-        var status = await _bot.SendMessage(convo.ChatId, "Working…", cancellationToken: ct);
-
+    /// <summary>
+    /// Inspects formats for the URL and presents a quality picker keyboard.
+    /// Quality selection then triggers download + upload (with file_id caching).
+    /// </summary>
+    private async Task StartUrlFlowAsync(BotConversation convo, string url, CancellationToken ct)
+    {
+        var status = await _bot.SendMessage(convo.ChatId, "Inspecting URL…", cancellationToken: ct);
         try
         {
-            // Fast path: nothing to download, just hand Telegram a cached file_id.
+            var info = await _webDownloader.FetchFormatsAsync(url, ct);
+            var token = _pending.StoreUrl(convo.UserId, url, info);
+
+            var rows = new List<InlineKeyboardButton[]>();
+            if (info.Heights.Length == 0)
+            {
+                rows.Add([InlineKeyboardButton.WithCallbackData("📹 Best available", $"q:{token}:best")]);
+            }
+            else
+            {
+                // One button per height (descending = best first).
+                for (int i = info.Heights.Length - 1; i >= 0; i--)
+                {
+                    var h = info.Heights[i];
+                    var size = info.SizeByHeight.TryGetValue(h, out var s) && s > 0
+                        ? $" · ~{FormatSize(s)}"
+                        : "";
+                    rows.Add([InlineKeyboardButton.WithCallbackData($"📹 {h}p{size}", $"q:{token}:{h}")]);
+                }
+            }
+            var audioLabel = info.ApproxAudioSize is long a && a > 0
+                ? $"🎵 Audio only · ~{FormatSize(a)}"
+                : "🎵 Audio only";
+            rows.Add([InlineKeyboardButton.WithCallbackData(audioLabel, $"q:{token}:a")]);
+            rows.Add([InlineKeyboardButton.WithCallbackData("✖ Cancel", $"qx:{token}")]);
+
+            var title = string.IsNullOrWhiteSpace(info.Title) ? "(no title)" : Truncate(info.Title!, 80);
+            await _bot.EditMessageText(convo.ChatId, status.MessageId,
+                $"<b>{System.Net.WebUtility.HtmlEncode(title)}</b>\nChoose a quality:",
+                parseMode: ParseMode.Html,
+                replyMarkup: new InlineKeyboardMarkup(rows),
+                cancellationToken: ct);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex) when (FindInner<SessionExpiredException>(ex) is null)
+        {
+            _logger.LogError(ex, "/url format probe failed");
+            await SafeEditAsync(convo.ChatId, status.MessageId, $"Failed: {ex.Message}", ct);
+            await SendMenuAsync(convo.ChatId, "What would you like to do next?", ct);
+        }
+    }
+
+    private async Task RunUrlDownloadAsync(BotConversation convo, string url, bool audioOnly, int? maxHeight, CancellationToken ct)
+    {
+        var urlKey = audioOnly ? $"audio:{url}"
+            : maxHeight is int h ? $"video:{h}:{url}"
+            : $"video:{url}";
+
+        var status = await _bot.SendMessage(convo.ChatId, "Working…", cancellationToken: ct);
+        try
+        {
             if (await _sender.TrySendCachedUrlAsync(convo.ChatId, urlKey, audioOnly, ct))
             {
                 await TryDeleteMessageAsync(convo.ChatId, status.MessageId, ct);
+                await SendMenuAsync(convo.ChatId, "Done (from cache). What's next?", ct);
                 return;
             }
 
             await _bot.EditMessageText(convo.ChatId, status.MessageId,
                 "Downloading via yt-dlp…", cancellationToken: ct);
 
-            var localPath = await _webDownloader.DownloadAsync(url, audioOnly, onProgress: null, ct);
+            var localPath = await _webDownloader.DownloadAsync(url, audioOnly, maxHeight, onProgress: null, ct);
             if (string.IsNullOrWhiteSpace(localPath) || !File.Exists(localPath))
                 throw new InvalidOperationException("yt-dlp returned no output file.");
 
@@ -520,12 +652,14 @@ internal sealed class BotUpdateHandler : BackgroundService
 
             await _sender.UploadUrlAsync(convo.ChatId, urlKey, localPath, audioOnly, ct);
             await TryDeleteMessageAsync(convo.ChatId, status.MessageId, ct);
+            await SendMenuAsync(convo.ChatId, "Done. What's next?", ct);
         }
         catch (OperationCanceledException) { throw; }
-        catch (Exception ex)
+        catch (Exception ex) when (FindInner<SessionExpiredException>(ex) is null)
         {
-            _logger.LogError(ex, "/url failed");
+            _logger.LogError(ex, "/url download failed");
             await SafeEditAsync(convo.ChatId, status.MessageId, $"Failed: {ex.Message}", ct);
+            await SendMenuAsync(convo.ChatId, "What would you like to do next?", ct);
         }
     }
 
@@ -562,7 +696,7 @@ internal sealed class BotUpdateHandler : BackgroundService
             await ShowSelectionAsync(convo, items, MediaSource.ChatMessages, status.MessageId, ct);
         }
         catch (OperationCanceledException) { throw; }
-        catch (Exception ex)
+        catch (Exception ex) when (FindInner<SessionExpiredException>(ex) is null)
         {
             _logger.LogError(ex, "/chat failed");
             await SafeEditAsync(convo.ChatId, status.MessageId, $"Failed: {ex.Message}", ct);
@@ -597,7 +731,7 @@ internal sealed class BotUpdateHandler : BackgroundService
             await ShowSelectionAsync(convo, items, MediaSource.ChatMessages, status.MessageId, ct);
         }
         catch (OperationCanceledException) { throw; }
-        catch (Exception ex)
+        catch (Exception ex) when (FindInner<SessionExpiredException>(ex) is null)
         {
             _logger.LogError(ex, "/search failed");
             await SafeEditAsync(convo.ChatId, status.MessageId, $"Failed: {ex.Message}", ct);
@@ -639,7 +773,7 @@ internal sealed class BotUpdateHandler : BackgroundService
             await ShowSelectionAsync(convo, items, MediaSource.Stories, status.MessageId, ct);
         }
         catch (OperationCanceledException) { throw; }
-        catch (Exception ex)
+        catch (Exception ex) when (FindInner<SessionExpiredException>(ex) is null)
         {
             _logger.LogError(ex, "/stories failed");
             await SafeEditAsync(convo.ChatId, status.MessageId, $"Failed: {ex.Message}", ct);
@@ -688,6 +822,7 @@ internal sealed class BotUpdateHandler : BackgroundService
         }
         var chatId = cb.Message.Chat.Id;
         var userId = cb.From.Id;
+        var convo = _conversations.GetOrAdd(chatId, _ => new BotConversation(chatId, userId));
 
         try
         {
@@ -696,6 +831,7 @@ internal sealed class BotUpdateHandler : BackgroundService
 
             switch (verb)
             {
+                // Media selection callbacks (from /chat, /search, /stories).
                 case "pick" when parts.Length == 3 && int.TryParse(parts[2], out var idx):
                     await _bot.AnswerCallbackQuery(cb.Id, "Sending…", cancellationToken: ct);
                     await SendSelectedAsync(userId, chatId, parts[1], [idx], ct);
@@ -713,12 +849,30 @@ internal sealed class BotUpdateHandler : BackgroundService
                     await SendSelectedAsync(userId, chatId, parts[1], all, ct);
                     return;
 
+                // Main menu buttons → set pending action and prompt for input.
+                case "m" when parts.Length == 2:
+                    await _bot.AnswerCallbackQuery(cb.Id, cancellationToken: ct);
+                    await HandleMenuButtonAsync(convo, parts[1], cb.Message.MessageId, ct);
+                    return;
+
+                // URL quality picker.
+                case "q" when parts.Length == 3:
+                    await _bot.AnswerCallbackQuery(cb.Id, "Starting…", cancellationToken: ct);
+                    await HandleQualityChoiceAsync(convo, parts[1], parts[2], cb.Message.MessageId, ct);
+                    return;
+
+                case "qx" when parts.Length == 2:
+                    _pending.ForgetUrl(userId, parts[1]);
+                    await _bot.AnswerCallbackQuery(cb.Id, "Cancelled", cancellationToken: ct);
+                    await SafeEditAsync(chatId, cb.Message.MessageId, "Cancelled.", ct);
+                    return;
+
                 default:
                     await _bot.AnswerCallbackQuery(cb.Id, cancellationToken: ct);
                     return;
             }
         }
-        catch (Exception ex)
+        catch (Exception ex) when (FindInner<SessionExpiredException>(ex) is null)
         {
             _logger.LogError(ex, "Callback failed: {Data}", cb.Data);
             try { await _bot.AnswerCallbackQuery(cb.Id, $"Failed: {ex.Message}", showAlert: true, cancellationToken: ct); }
@@ -827,6 +981,177 @@ internal sealed class BotUpdateHandler : BackgroundService
         var ext = Path.GetExtension(primary);
         var suffixed = Path.Combine(dir, $"{stem}_{item.MsgId}{ext}");
         return suffixed;
+    }
+
+    // ── Menu, pending input dispatch, URL quality picker ─────────────────────
+
+    private async Task HandleMenuAsync(BotConversation convo, CancellationToken ct)
+    {
+        await SendMenuAsync(convo.ChatId, "What would you like to do?", ct);
+    }
+
+    /// <summary>
+    /// Sends the main inline keyboard. Used by /menu, /start, and after every
+    /// terminal action (success or failure) so the user is never stuck.
+    /// </summary>
+    private async Task SendMenuAsync(long chatId, string prompt, CancellationToken ct)
+    {
+        var rows = new InlineKeyboardButton[][]
+        {
+            [InlineKeyboardButton.WithCallbackData("📥 By link",        "m:bylink"),
+             InlineKeyboardButton.WithCallbackData("▶️ From chat",      "m:chat")],
+            [InlineKeyboardButton.WithCallbackData("🔍 Search",         "m:search"),
+             InlineKeyboardButton.WithCallbackData("📖 Stories",        "m:stories")],
+            [InlineKeyboardButton.WithCallbackData("📖 Pinned stories", "m:pstories"),
+             InlineKeyboardButton.WithCallbackData("🌐 URL download",   "m:url")],
+            [InlineKeyboardButton.WithCallbackData("📊 Status",         "m:status")],
+        };
+        try
+        {
+            await _bot.SendMessage(chatId, prompt,
+                replyMarkup: new InlineKeyboardMarkup(rows),
+                cancellationToken: ct);
+        }
+        catch (Exception ex) { _logger.LogDebug(ex, "Send menu failed"); }
+    }
+
+    private async Task HandleMenuButtonAsync(BotConversation convo, string action, int menuMessageId, CancellationToken ct)
+    {
+        // Sub-flows that need a session must verify it first.
+        bool needsLogin = action is "bylink" or "chat" or "search" or "stories" or "pstories" or "url";
+        if (needsLogin && !await RequireLoginAsync(convo, ct)) return;
+
+        switch (action)
+        {
+            case "bylink":
+                convo.ClearPending();
+                convo.Pending = PendingAction.AwaitingByLink;
+                await _bot.SendMessage(convo.ChatId, "Send the t.me link.", cancellationToken: ct);
+                return;
+
+            case "chat":
+                convo.ClearPending();
+                convo.Pending = PendingAction.AwaitingChatTarget;
+                await _bot.SendMessage(convo.ChatId,
+                    "Send the chat (e.g. <code>@somechannel</code> or numeric id).\n" +
+                    "Tip: add a space and a number to set the limit, e.g. <code>@somechannel 40</code>.",
+                    parseMode: ParseMode.Html, cancellationToken: ct);
+                return;
+
+            case "search":
+                convo.ClearPending();
+                convo.Pending = PendingAction.AwaitingSearchTarget;
+                await _bot.SendMessage(convo.ChatId,
+                    "Send the chat to search in (e.g. <code>@somechannel</code>).",
+                    parseMode: ParseMode.Html, cancellationToken: ct);
+                return;
+
+            case "stories":
+                convo.ClearPending();
+                convo.Pending = PendingAction.AwaitingStoriesTarget;
+                await _bot.SendMessage(convo.ChatId, "Send the user/channel for active stories.", cancellationToken: ct);
+                return;
+
+            case "pstories":
+                convo.ClearPending();
+                convo.Pending = PendingAction.AwaitingStoriesPinnedTarget;
+                await _bot.SendMessage(convo.ChatId, "Send the user/channel for pinned stories.", cancellationToken: ct);
+                return;
+
+            case "url":
+                convo.ClearPending();
+                convo.Pending = PendingAction.AwaitingUrl;
+                await _bot.SendMessage(convo.ChatId,
+                    "Send the link (YouTube, TikTok, Instagram, …). I'll show available qualities.",
+                    cancellationToken: ct);
+                return;
+
+            case "status":
+                await HandleStatusAsync(convo, ct);
+                return;
+        }
+    }
+
+    /// <summary>
+    /// If the user has a pending menu action, route the plain text to the
+    /// matching command handler. Returns true if the message was consumed.
+    /// </summary>
+    private async Task<bool> TryHandlePendingAsync(BotConversation convo, string text, int messageId, CancellationToken ct)
+    {
+        var pending = convo.Pending;
+        if (pending == PendingAction.None) return false;
+
+        switch (pending)
+        {
+            case PendingAction.AwaitingByLink:
+                convo.ClearPending();
+                await HandleByLinkAsync(convo, $"/by_link {text}", ct);
+                return true;
+
+            case PendingAction.AwaitingChatTarget:
+                convo.ClearPending();
+                await HandleChatAsync(convo, $"/chat {text}", ct);
+                return true;
+
+            case PendingAction.AwaitingSearchTarget:
+                convo.PendingArg = text;
+                convo.Pending = PendingAction.AwaitingSearchQuery;
+                await _bot.SendMessage(convo.ChatId,
+                    $"Now send the search query for <code>{System.Net.WebUtility.HtmlEncode(text)}</code>.",
+                    parseMode: ParseMode.Html, cancellationToken: ct);
+                return true;
+
+            case PendingAction.AwaitingSearchQuery:
+                var target = convo.PendingArg ?? "";
+                convo.ClearPending();
+                await HandleSearchAsync(convo, $"/search {target} {text}", ct);
+                return true;
+
+            case PendingAction.AwaitingStoriesTarget:
+                convo.ClearPending();
+                await HandleStoriesAsync(convo, $"/stories {text}", ct);
+                return true;
+
+            case PendingAction.AwaitingStoriesPinnedTarget:
+                convo.ClearPending();
+                await HandleStoriesAsync(convo, $"/stories {text} pinned", ct);
+                return true;
+
+            case PendingAction.AwaitingUrl:
+                convo.ClearPending();
+                await StartUrlFlowAsync(convo, text, ct);
+                return true;
+
+            default:
+                return false;
+        }
+    }
+
+    private async Task HandleQualityChoiceAsync(BotConversation convo, string token, string choice, int pickerMessageId, CancellationToken ct)
+    {
+        var entry = _pending.GetUrl(convo.UserId, token);
+        if (entry is null)
+        {
+            await SafeEditAsync(convo.ChatId, pickerMessageId,
+                "This quality picker has expired. Re-run the URL.", ct);
+            return;
+        }
+        var (url, _) = entry.Value;
+
+        bool audioOnly = choice == "a";
+        int? maxHeight = audioOnly || choice == "best"
+            ? null
+            : int.TryParse(choice, out var h) ? h : (int?)null;
+
+        // Replace the picker with a working status so the chat stays clean.
+        await SafeEditAsync(convo.ChatId, pickerMessageId,
+            audioOnly ? "Audio selected. Working…" :
+            maxHeight is int hh ? $"{hh}p selected. Working…" :
+            "Best available selected. Working…",
+            ct);
+        _pending.ForgetUrl(convo.UserId, token);
+
+        await RunUrlDownloadAsync(convo, url, audioOnly, maxHeight, ct);
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────

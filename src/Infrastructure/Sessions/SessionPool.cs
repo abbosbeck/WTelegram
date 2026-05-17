@@ -72,10 +72,22 @@ public sealed class SessionPool : IAsyncDisposable
                 _logger.LogInformation("Session acquired for user {UserId} ({Name})", userId, me?.username ?? me?.first_name);
                 return client;
             }
+            catch (Exception ex) when (UnwrapSessionExpired(ex) is SessionExpiredException expired)
+            {
+                // The stored bytes are useless — drop them so a fresh /login
+                // can start cleanly instead of looping on the same dead key.
+                client.Dispose();
+                stream.Dispose();
+                _entries.TryRemove(userId, out _);
+                try { await _store.DeleteAsync(userId, ct); }
+                catch (Exception delEx) { _logger.LogWarning(delEx, "Failed to delete expired session for user {UserId}", userId); }
+                throw expired;
+            }
             catch
             {
                 client.Dispose();
                 stream.Dispose();
+                _entries.TryRemove(userId, out _);
                 throw;
             }
         }
@@ -116,8 +128,7 @@ public sealed class SessionPool : IAsyncDisposable
     private string AwaitFromLogin(long userId, Func<LoginSession, Task<string>> selector)
     {
         var login = _loginCoordinator.Get(userId)
-            ?? throw new InvalidOperationException(
-                $"WTelegramClient asked for credentials for user {userId} but no LoginSession is registered.");
+            ?? throw new SessionExpiredException(userId);
         return selector(login).GetAwaiter().GetResult();
     }
 
@@ -140,6 +151,13 @@ public sealed class SessionPool : IAsyncDisposable
         {
             _capacityLock.Release();
         }
+    }
+
+    private static SessionExpiredException? UnwrapSessionExpired(Exception? ex)
+    {
+        for (var e = ex; e is not null; e = e.InnerException)
+            if (e is SessionExpiredException se) return se;
+        return null;
     }
 
     private static string? BuildDisplayName(TL.User? me)

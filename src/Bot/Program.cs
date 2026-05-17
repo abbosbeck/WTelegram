@@ -41,6 +41,7 @@ internal static class Program
         });
 
         builder.Services.AddSingleton<MediaSelectionCache>();
+        builder.Services.AddSingleton<PendingActionCache>();
         builder.Services.AddSingleton<BotMediaSender>();
         builder.Services.AddHostedService<BotUpdateHandler>();
 
