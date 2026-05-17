@@ -436,12 +436,18 @@ internal sealed class BotUpdateHandler : BackgroundService
         }
         convo.ClearPending();
 
+        // Telegram's chat picker returns Bot-API-style channel ids (-100<channel_id>);
+        // MTProto's dialog cache is keyed on the raw channel_id, so unwrap.
+        long mtprotoId = targetId < -1_000_000_000_000L
+            ? -1_000_000_000_000L - targetId
+            : targetId;
+
         // Dismiss the native reply keyboard before kicking off the long-running fetch.
-        await _bot.SendMessage(convo.ChatId, $"Using chat {targetId}…",
+        await _bot.SendMessage(convo.ChatId, $"Using chat {mtprotoId}…",
             replyMarkup: new ReplyKeyboardRemove(),
             cancellationToken: ct);
 
-        await HandleStoriesAsync(convo, $"/stories {targetId}", ct);
+        await HandleStoriesAsync(convo, $"/stories {mtprotoId}", ct);
     }
 
     private async Task HandleSharedContactAsync(BotConversation convo, TgContact contact, CancellationToken ct)
