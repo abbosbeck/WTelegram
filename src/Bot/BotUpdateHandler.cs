@@ -15,6 +15,9 @@ using Telegram.Bot.Types.Enums;
 using Telegram.Bot.Types.ReplyMarkups;
 using TL;
 using TgUpdate = Telegram.Bot.Types.Update;
+using TgContact = Telegram.Bot.Types.Contact;
+using TgReplyKeyboardMarkup = Telegram.Bot.Types.ReplyMarkups.ReplyKeyboardMarkup;
+using TgKeyboardButton = Telegram.Bot.Types.ReplyMarkups.KeyboardButton;
 
 namespace Bot;
 
@@ -116,13 +119,26 @@ internal sealed class BotUpdateHandler : BackgroundService
 
         if (update.Message is not { } message) return;
         if (message.From is null) return;
-        if (string.IsNullOrEmpty(message.Text)) return;
 
         var chatId = message.Chat.Id;
         var userId = message.From.Id;
-        var text = message.Text.Trim();
-
         var convo = _conversations.GetOrAdd(chatId, _ => new BotConversation(chatId, userId));
+
+        // Native "Share contact" tap arrives as a Contact message (no Text).
+        if (message.Contact is { } contact)
+        {
+            try { await HandleSharedContactAsync(convo, contact, ct); }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to handle shared contact for chat {ChatId}", chatId);
+                try { await _bot.SendMessage(chatId, $"Couldn't process the contact: {ex.Message}", cancellationToken: ct); }
+                catch { /* ignore */ }
+            }
+            return;
+        }
+
+        if (string.IsNullOrEmpty(message.Text)) return;
+        var text = message.Text.Trim();
 
         try
         {
@@ -323,8 +339,59 @@ internal sealed class BotUpdateHandler : BackgroundService
             }
         }, CancellationToken.None);
 
+        var keyboard = new TgReplyKeyboardMarkup(
+            new[]
+            {
+                new[] { TgKeyboardButton.WithRequestContact("📱 Share my phone number") }
+            })
+        { ResizeKeyboard = true, OneTimeKeyboard = true };
+
         await _bot.SendMessage(convo.ChatId,
-            "Send your phone number in international format (e.g. +998901234567).",
+            "Tap the button below to share your phone number, or type it in international format (e.g. <code>+998901234567</code>).",
+            parseMode: ParseMode.Html,
+            replyMarkup: keyboard,
+            cancellationToken: ct);
+    }
+
+    private async Task HandleSharedContactAsync(BotConversation convo, TgContact contact, CancellationToken ct)
+    {
+        // No login in progress — dismiss the keyboard and ignore.
+        if (convo.Login is null || convo.Step != LoginStep.AwaitingPhone)
+        {
+            await _bot.SendMessage(convo.ChatId,
+                "No login in progress. Send /login to begin.",
+                replyMarkup: new ReplyKeyboardRemove(),
+                cancellationToken: ct);
+            return;
+        }
+
+        // Reject sharing somebody else's contact — wouldn't authenticate anyway.
+        if (contact.UserId is long uid && uid != convo.UserId)
+        {
+            await _bot.SendMessage(convo.ChatId,
+                "Please share your *own* phone number, not someone else's.",
+                parseMode: ParseMode.Markdown,
+                replyMarkup: new ReplyKeyboardRemove(),
+                cancellationToken: ct);
+            return;
+        }
+
+        var phone = contact.PhoneNumber.StartsWith("+") ? contact.PhoneNumber : "+" + contact.PhoneNumber;
+        convo.Login.SubmitPhone(phone);
+        convo.Step = LoginStep.AwaitingCode;
+
+        await _bot.SendMessage(convo.ChatId,
+            "Got it ✓\n\n" +
+            "Telegram is sending a verification code.\n" +
+            "On a fresh device, Telegram refuses to deliver the first code via chat. " +
+            "Open the official Telegram app → Settings → Devices → the new session entry; " +
+            "the code is part of that entry's title.\n\n" +
+            "⚠️ Telegram auto-invalidates any login code that appears as plain digits " +
+            "inside a chat. To avoid that, send the code with separators between digits, " +
+            "e.g. <code>1-2-3-4-5</code> or <code>1 2 3 4 5</code>. " +
+            "I'll strip the separators before submitting it.",
+            parseMode: ParseMode.Html,
+            replyMarkup: new ReplyKeyboardRemove(),
             cancellationToken: ct);
     }
 

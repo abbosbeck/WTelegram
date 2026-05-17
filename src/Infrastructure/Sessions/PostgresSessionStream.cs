@@ -114,13 +114,44 @@ internal sealed class PostgresSessionStream : Stream
         });
     }
 
+    /// <summary>
+    /// Synchronously flushes any pending bytes. Used on Dispose so the process
+    /// can't exit before the latest auth_key / salt rotation has landed in Postgres.
+    /// </summary>
+    private void FlushSync()
+    {
+        byte[]? snapshot;
+        string? phone;
+        string? name;
+        lock (_flushLock)
+        {
+            if (!_dirty) return;
+            snapshot = _buffer.ToArray();
+            phone = _phone;
+            name = _displayName;
+            _dirty = false;
+            _lastFlush = DateTime.UtcNow;
+        }
+
+        try
+        {
+            // Block intentionally: Stream.Dispose is sync, and losing the final
+            // delta on shutdown is exactly the bug we're closing.
+            _store.SaveAsync(_userId, snapshot!, phone, name).GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to persist final session bytes for user {UserId} on dispose", _userId);
+        }
+    }
+
     protected override void Dispose(bool disposing)
     {
         if (_disposed) { base.Dispose(disposing); return; }
         _disposed = true;
         if (disposing)
         {
-            try { MaybeFlushNow(force: true); } catch { /* swallow on dispose */ }
+            try { FlushSync(); } catch { /* swallow on dispose */ }
             _buffer.Dispose();
         }
         base.Dispose(disposing);
