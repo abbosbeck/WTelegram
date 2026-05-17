@@ -44,16 +44,40 @@ internal sealed class BotMediaSender
 
     /// <summary>
     /// Uploads the local file once, caches the returned file_id, deletes the file.
+    /// For videos, pass <paramref name="width"/>, <paramref name="height"/>, and
+    /// <paramref name="durationSeconds"/> so Telegram clients render the inline
+    /// streaming player instead of demoting it to a generic document.
     /// </summary>
-    public async Task UploadUrlAsync(long chatId, string urlKey, string localPath, bool audioOnly, CancellationToken ct)
+    public async Task UploadUrlAsync(
+        long chatId,
+        string urlKey,
+        string localPath,
+        bool audioOnly,
+        CancellationToken ct,
+        int? width = null,
+        int? height = null,
+        int? durationSeconds = null)
     {
         await using var fs = File.OpenRead(localPath);
         var name = Path.GetFileName(localPath);
         var inputFile = TgInputFile.FromStream(fs, name);
 
-        var sent = audioOnly
-            ? await _bot.SendAudio(chatId, inputFile, cancellationToken: ct)
-            : await _bot.SendVideo(chatId, inputFile, supportsStreaming: true, cancellationToken: ct);
+        Message sent;
+        if (audioOnly)
+        {
+            sent = await _bot.SendAudio(chatId, inputFile,
+                duration: durationSeconds,
+                cancellationToken: ct);
+        }
+        else
+        {
+            sent = await _bot.SendVideo(chatId, inputFile,
+                duration: durationSeconds,
+                width: width,
+                height: height,
+                supportsStreaming: true,
+                cancellationToken: ct);
+        }
 
         var fileId = ExtractFileId(sent);
         if (fileId is not null)

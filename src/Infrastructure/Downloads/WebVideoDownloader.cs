@@ -132,17 +132,25 @@ public sealed class WebVideoDownloader
 
         var ytdl = await EnsureReadyAsync(ct);
 
+        // Prefer h264+aac in mp4 containers so Telegram can stream without re-encoding.
+        // Falls back to whatever's available for sites that don't expose mp4 (we then
+        // rely on MergeOutputFormat=mp4 + ffmpeg to remux into a streamable container).
         var format = audioOnly
             ? "bestaudio"
             : maxHeight is int h
-                ? $"bestvideo[height<={h}]+bestaudio/best[height<={h}]"
+                ? $"bestvideo[height<={h}][ext=mp4][vcodec~='^(avc1|h264)']+bestaudio[ext=m4a]/bestvideo[height<={h}]+bestaudio/best[height<={h}]"
                 : _options.Format;
 
         var overrideOptions = new OptionSet
         {
             Format = format,
-            NoPlaylist = true
+            NoPlaylist = true,
         };
+        if (!audioOnly)
+        {
+            // Ensures the final file is .mp4 (remuxes if needed; re-encodes only if no h264/aac variant exists).
+            overrideOptions.MergeOutputFormat = DownloadMergeFormat.Mp4;
+        }
         if (!string.IsNullOrWhiteSpace(_options.CookiesPath) && File.Exists(_options.CookiesPath))
             overrideOptions.Cookies = _options.CookiesPath;
 
@@ -218,7 +226,8 @@ public sealed class WebVideoDownloader
             Title: data.Title,
             Heights: heights.ToArray(),
             SizeByHeight: sizeByHeight,
-            ApproxAudioSize: approxAudioSize);
+            ApproxAudioSize: approxAudioSize,
+            DurationSeconds: data.Duration is float d && d > 0 ? (int?)Math.Round(d) : null);
     }
 
     private static string BuildManifestKey(string url, bool audioOnly, int? maxHeight) =>
@@ -232,4 +241,5 @@ public sealed record UrlFormatInfo(
     string? Title,
     int[] Heights,
     IReadOnlyDictionary<int, long> SizeByHeight,
-    long? ApproxAudioSize);
+    long? ApproxAudioSize,
+    int? DurationSeconds);
