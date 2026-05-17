@@ -6,6 +6,7 @@ namespace Application.Sessions;
 /// </summary>
 public interface IUserSessionStore
 {
+    Task<bool> ExistsAsync(long userId, CancellationToken ct = default);
     Task<byte[]?> LoadAsync(long userId, CancellationToken ct = default);
     Task SaveAsync(long userId, byte[] sessionBytes, string? phone, string? displayName, CancellationToken ct = default);
     Task TouchAsync(long userId, CancellationToken ct = default);

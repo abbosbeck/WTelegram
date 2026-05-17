@@ -23,6 +23,13 @@ public sealed class UserSessionStore : IUserSessionStore
         _logger = logger;
     }
 
+    public async Task<bool> ExistsAsync(long userId, CancellationToken ct = default)
+    {
+        await using var db = await _dbFactory.CreateDbContextAsync(ct);
+        return await db.UserSessions.AsNoTracking()
+            .AnyAsync(x => x.TelegramUserId == userId && x.IsActive, ct);
+    }
+
     public async Task<byte[]?> LoadAsync(long userId, CancellationToken ct = default)
     {
         await using var db = await _dbFactory.CreateDbContextAsync(ct);

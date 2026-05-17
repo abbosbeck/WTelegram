@@ -212,7 +212,7 @@ internal sealed class BotUpdateHandler : BackgroundService
 
     private async Task HandleLoginAsync(BotConversation convo, CancellationToken ct)
     {
-        if (_sessionPool.IsCached(convo.UserId))
+        if (_sessionPool.IsCached(convo.UserId) || await _sessionStore.ExistsAsync(convo.UserId, ct))
         {
             await _bot.SendMessage(convo.ChatId,
                 "You're already signed in. Use /logout first if you want to switch accounts.",
@@ -415,13 +415,7 @@ internal sealed class BotUpdateHandler : BackgroundService
         }
         var link = parts[1];
 
-        if (!_sessionPool.IsCached(convo.UserId))
-        {
-            await _bot.SendMessage(convo.ChatId,
-                "You need to /login first so I can use your Telegram account to fetch the message.",
-                cancellationToken: ct);
-            return;
-        }
+        if (!await RequireLoginAsync(convo, ct)) return;
 
         var status = await _bot.SendMessage(convo.ChatId, "Resolving link…", cancellationToken: ct);
 
@@ -837,9 +831,16 @@ internal sealed class BotUpdateHandler : BackgroundService
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Returns true if the user has a session available — either already
+    /// rehydrated in-memory, or sitting encrypted in Postgres ready to be loaded.
+    /// Only prompts the user to /login when neither is true.
+    /// </summary>
     private async Task<bool> RequireLoginAsync(BotConversation convo, CancellationToken ct)
     {
         if (_sessionPool.IsCached(convo.UserId)) return true;
+        if (await _sessionStore.ExistsAsync(convo.UserId, ct)) return true;
+
         await _bot.SendMessage(convo.ChatId,
             "You need to /login first so I can use your Telegram account.",
             cancellationToken: ct);
