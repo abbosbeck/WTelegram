@@ -40,6 +40,8 @@ internal static class Program
             return new TelegramBotClient(token);
         });
 
+        builder.Services.AddSingleton<MediaSelectionCache>();
+        builder.Services.AddSingleton<BotMediaSender>();
         builder.Services.AddHostedService<BotUpdateHandler>();
 
         using var host = builder.Build();

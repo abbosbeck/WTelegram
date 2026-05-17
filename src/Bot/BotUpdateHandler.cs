@@ -1,6 +1,9 @@
 using System.Collections.Concurrent;
 using Application.Configuration;
 using Application.Sessions;
+using Domain.Common;
+using Domain.Downloads;
+using Infrastructure.Downloads;
 using Infrastructure.Sessions;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -9,6 +12,9 @@ using Telegram.Bot;
 using Telegram.Bot.Polling;
 using Telegram.Bot.Types;
 using Telegram.Bot.Types.Enums;
+using Telegram.Bot.Types.ReplyMarkups;
+using TL;
+using TgUpdate = Telegram.Bot.Types.Update;
 
 namespace Bot;
 
@@ -22,32 +28,53 @@ internal sealed class BotUpdateHandler : BackgroundService
     private readonly LoginCoordinator _loginCoordinator;
     private readonly SessionPool _sessionPool;
     private readonly IUserSessionStore _sessionStore;
+    private readonly TelegramService _telegram;
+    private readonly MessageLinkResolver _linkResolver;
+    private readonly WebVideoDownloader _webDownloader;
+    private readonly BotMediaSender _sender;
+    private readonly MediaSelectionCache _selections;
+    private readonly TelegramOptions _telegramOptions;
     private readonly ILogger<BotUpdateHandler> _logger;
 
     private readonly ConcurrentDictionary<long, BotConversation> _conversations = new();
+    private readonly ConcurrentDictionary<long, InputPeer> _botPeerPerUser = new();
+    private string? _botUsername;
 
     public BotUpdateHandler(
         ITelegramBotClient bot,
         LoginCoordinator loginCoordinator,
         SessionPool sessionPool,
         IUserSessionStore sessionStore,
+        TelegramService telegram,
+        MessageLinkResolver linkResolver,
+        WebVideoDownloader webDownloader,
+        BotMediaSender sender,
+        MediaSelectionCache selections,
+        IOptions<TelegramOptions> telegramOptions,
         ILogger<BotUpdateHandler> logger)
     {
         _bot = bot;
         _loginCoordinator = loginCoordinator;
         _sessionPool = sessionPool;
         _sessionStore = sessionStore;
+        _telegram = telegram;
+        _linkResolver = linkResolver;
+        _webDownloader = webDownloader;
+        _sender = sender;
+        _selections = selections;
+        _telegramOptions = telegramOptions.Value;
         _logger = logger;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         var me = await _bot.GetMe(stoppingToken);
+        _botUsername = me.Username;
         _logger.LogInformation("Bot started as @{Username} (id {Id})", me.Username, me.Id);
 
         var receiverOptions = new ReceiverOptions
         {
-            AllowedUpdates = [UpdateType.Message],
+            AllowedUpdates = [UpdateType.Message, UpdateType.CallbackQuery],
             DropPendingUpdates = true,
         };
 
@@ -58,8 +85,14 @@ internal sealed class BotUpdateHandler : BackgroundService
             cancellationToken: stoppingToken);
     }
 
-    private async Task HandleUpdateAsync(ITelegramBotClient bot, Update update, CancellationToken ct)
+    private async Task HandleUpdateAsync(ITelegramBotClient bot, TgUpdate update, CancellationToken ct)
     {
+        if (update.CallbackQuery is { } cb)
+        {
+            await HandleCallbackAsync(cb, ct);
+            return;
+        }
+
         if (update.Message is not { } message) return;
         if (message.From is null) return;
         if (string.IsNullOrEmpty(message.Text)) return;
@@ -93,9 +126,24 @@ internal sealed class BotUpdateHandler : BackgroundService
                     case "/status":
                         await HandleStatusAsync(convo, ct);
                         return;
+                    case "/by_link":
+                        await HandleByLinkAsync(convo, text, ct);
+                        return;
+                    case "/url":
+                        await HandleUrlAsync(convo, text, ct);
+                        return;
+                    case "/chat":
+                        await HandleChatAsync(convo, text, ct);
+                        return;
+                    case "/search":
+                        await HandleSearchAsync(convo, text, ct);
+                        return;
+                    case "/stories":
+                        await HandleStoriesAsync(convo, text, ct);
+                        return;
                     default:
                         await _bot.SendMessage(chatId,
-                            "Unknown command. Try /login, /cancel, /logout, /status, /help.",
+                            "Unknown command. Try /login, /by_link, /url, /chat, /search, /stories, /cancel, /logout, /status, /help.",
                             cancellationToken: ct);
                         return;
                 }
@@ -151,12 +199,14 @@ internal sealed class BotUpdateHandler : BackgroundService
         const string help =
             "Telegram Downloader Bot\n\n" +
             "Commands:\n" +
-            "  /login   – sign in to Telegram MTProto (phone + code + 2FA)\n" +
-            "  /cancel  – cancel an in-progress login\n" +
-            "  /logout  – forget your stored session\n" +
-            "  /status  – show current session state\n" +
-            "  /help    – this message\n\n" +
-            "Download commands land in Phase 3.";
+            "  /login                       – sign in to Telegram MTProto\n" +
+            "  /by_link <t.me/…>            – fetch one message into this chat\n" +
+            "  /chat <@user|id> [limit]     – list recent media in a chat\n" +
+            "  /search <@chat> <query>      – search media in a chat\n" +
+            "  /stories <@user> [pinned]    – fetch active or pinned stories\n" +
+            "  /url <link>                  – download from YouTube/TikTok/… via yt-dlp\n" +
+            "  /cancel /logout /status      – session control\n" +
+            "  /help                        – this message";
         await _bot.SendMessage(chatId, help, cancellationToken: ct);
     }
 
@@ -351,5 +401,475 @@ internal sealed class BotUpdateHandler : BackgroundService
             $"Session cached: {cached}\n" +
             $"Login step: {step}";
         await _bot.SendMessage(convo.ChatId, msg, cancellationToken: ct);
+    }
+
+    private async Task HandleByLinkAsync(BotConversation convo, string text, CancellationToken ct)
+    {
+        var parts = text.Split(' ', 2, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (parts.Length < 2)
+        {
+            await _bot.SendMessage(convo.ChatId,
+                "Usage: /by_link <t.me/...> — e.g. /by_link https://t.me/somechannel/42",
+                cancellationToken: ct);
+            return;
+        }
+        var link = parts[1];
+
+        if (!_sessionPool.IsCached(convo.UserId))
+        {
+            await _bot.SendMessage(convo.ChatId,
+                "You need to /login first so I can use your Telegram account to fetch the message.",
+                cancellationToken: ct);
+            return;
+        }
+
+        var status = await _bot.SendMessage(convo.ChatId, "Resolving link…", cancellationToken: ct);
+
+        try
+        {
+            var client = await _sessionPool.AcquireAsync(convo.UserId, ct);
+            var (sourcePeer, _, message) = await _linkResolver.ResolveAsync(client, link, ct);
+
+            var botPeer = await GetBotPeerForAsync(client, ct);
+
+            await _bot.EditMessageText(convo.ChatId, status.MessageId,
+                "Forwarding via Telegram CDN…", cancellationToken: ct);
+
+            await _telegram.ForwardMessageAsync(
+                client,
+                source: sourcePeer,
+                messageId: message.ID,
+                target: botPeer,
+                dropAuthor: true,
+                ct);
+
+            await _bot.DeleteMessage(convo.ChatId, status.MessageId, ct);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Forward by link failed for user {UserId}", convo.UserId);
+            try
+            {
+                await _bot.EditMessageText(convo.ChatId, status.MessageId,
+                    $"Failed: {ex.Message}", cancellationToken: ct);
+            }
+            catch { /* ignore */ }
+        }
+    }
+
+    /// <summary>
+    /// Resolves this bot's <see cref="InputPeer"/> as seen by a specific user's
+    /// MTProto client. Cached per user — the access_hash is per-DC and per-user.
+    /// </summary>
+    private async Task<InputPeer> GetBotPeerForAsync(WTelegram.Client client, CancellationToken ct)
+    {
+        // Find which user this client belongs to by inspecting the cache.
+        // Cheaper: ask each call site to pass userId. We do it via the bot username
+        // resolved from this user's perspective, which Telegram handles entirely server-side.
+        if (string.IsNullOrEmpty(_botUsername))
+            throw new InvalidOperationException("Bot username is not known yet.");
+
+        // Keying the cache by client identity avoids the userId plumbing.
+        // ConditionalWeakTable would be ideal here, but a plain dictionary keyed
+        // by the client's hash code is fine — Clients are long-lived in the pool.
+        var key = (long)client.GetHashCode();
+        if (_botPeerPerUser.TryGetValue(key, out var cached)) return cached;
+
+        var resolved = await client.Contacts_ResolveUsername(_botUsername).WaitAsync(ct);
+        if (resolved.peer is not PeerUser pu || !resolved.users.TryGetValue(pu.user_id, out var botUser))
+            throw new InvalidOperationException(
+                $"Could not resolve bot @{_botUsername} via the user's account.");
+
+        var peer = botUser.ToInputPeer();
+        _botPeerPerUser[key] = peer;
+        return peer;
+    }
+
+    // ── /url ─────────────────────────────────────────────────────────────────
+
+    private async Task HandleUrlAsync(BotConversation convo, string text, CancellationToken ct)
+    {
+        var parts = text.Split(' ', 3, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (parts.Length < 2)
+        {
+            await _bot.SendMessage(convo.ChatId,
+                "Usage: /url <link> [audio]\nExamples:\n  /url https://youtu.be/abc\n  /url https://youtu.be/abc audio",
+                cancellationToken: ct);
+            return;
+        }
+        var url = parts[1];
+        var audioOnly = parts.Length == 3 && parts[2].StartsWith("a", StringComparison.OrdinalIgnoreCase);
+        var urlKey = audioOnly ? $"audio:{url}" : $"video:{url}";
+
+        var status = await _bot.SendMessage(convo.ChatId, "Working…", cancellationToken: ct);
+
+        try
+        {
+            // Fast path: nothing to download, just hand Telegram a cached file_id.
+            if (await _sender.TrySendCachedUrlAsync(convo.ChatId, urlKey, audioOnly, ct))
+            {
+                await TryDeleteMessageAsync(convo.ChatId, status.MessageId, ct);
+                return;
+            }
+
+            await _bot.EditMessageText(convo.ChatId, status.MessageId,
+                "Downloading via yt-dlp…", cancellationToken: ct);
+
+            var localPath = await _webDownloader.DownloadAsync(url, audioOnly, onProgress: null, ct);
+            if (string.IsNullOrWhiteSpace(localPath) || !File.Exists(localPath))
+                throw new InvalidOperationException("yt-dlp returned no output file.");
+
+            await _bot.EditMessageText(convo.ChatId, status.MessageId,
+                "Uploading to Telegram (last time — future requests will reuse the cached file)…",
+                cancellationToken: ct);
+
+            await _sender.UploadUrlAsync(convo.ChatId, urlKey, localPath, audioOnly, ct);
+            await TryDeleteMessageAsync(convo.ChatId, status.MessageId, ct);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "/url failed");
+            await SafeEditAsync(convo.ChatId, status.MessageId, $"Failed: {ex.Message}", ct);
+        }
+    }
+
+    // ── /chat, /search ───────────────────────────────────────────────────────
+
+    private async Task HandleChatAsync(BotConversation convo, string text, CancellationToken ct)
+    {
+        if (!await RequireLoginAsync(convo, ct)) return;
+
+        var parts = text.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (parts.Length < 2)
+        {
+            await _bot.SendMessage(convo.ChatId,
+                "Usage: /chat <@username|id> [limit=20]",
+                cancellationToken: ct);
+            return;
+        }
+        var target = parts[1];
+        int limit = parts.Length >= 3 && int.TryParse(parts[2], out var n) ? Math.Clamp(n, 1, 50) : 20;
+
+        var status = await _bot.SendMessage(convo.ChatId, "Resolving chat…", cancellationToken: ct);
+
+        try
+        {
+            var client = await _sessionPool.AcquireAsync(convo.UserId, ct);
+            var (peer, chatId) = await _telegram.ResolvePeerAsync(client, target, ct);
+
+            await _bot.EditMessageText(convo.ChatId, status.MessageId,
+                $"Fetching last {limit} media items…", cancellationToken: ct);
+
+            var items = await _telegram.GetMediaAsync(client, peer, chatId, limit,
+                kinds: new HashSet<MediaKind>(), ct);
+
+            await ShowSelectionAsync(convo, items, MediaSource.ChatMessages, status.MessageId, ct);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "/chat failed");
+            await SafeEditAsync(convo.ChatId, status.MessageId, $"Failed: {ex.Message}", ct);
+        }
+    }
+
+    private async Task HandleSearchAsync(BotConversation convo, string text, CancellationToken ct)
+    {
+        if (!await RequireLoginAsync(convo, ct)) return;
+
+        var parts = text.Split(' ', 3, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (parts.Length < 3)
+        {
+            await _bot.SendMessage(convo.ChatId,
+                "Usage: /search <@username|id> <query>",
+                cancellationToken: ct);
+            return;
+        }
+        var target = parts[1];
+        var query = parts[2];
+
+        var status = await _bot.SendMessage(convo.ChatId, "Searching…", cancellationToken: ct);
+
+        try
+        {
+            var client = await _sessionPool.AcquireAsync(convo.UserId, ct);
+            var (peer, chatId) = await _telegram.ResolvePeerAsync(client, target, ct);
+
+            var items = await _telegram.SearchMediaAsync(client, peer, chatId, query,
+                kinds: new HashSet<MediaKind>(), limit: 50, ct);
+
+            await ShowSelectionAsync(convo, items, MediaSource.ChatMessages, status.MessageId, ct);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "/search failed");
+            await SafeEditAsync(convo.ChatId, status.MessageId, $"Failed: {ex.Message}", ct);
+        }
+    }
+
+    // ── /stories ─────────────────────────────────────────────────────────────
+
+    private async Task HandleStoriesAsync(BotConversation convo, string text, CancellationToken ct)
+    {
+        if (!await RequireLoginAsync(convo, ct)) return;
+
+        var parts = text.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (parts.Length < 2)
+        {
+            await _bot.SendMessage(convo.ChatId,
+                "Usage: /stories <@username|id> [pinned]",
+                cancellationToken: ct);
+            return;
+        }
+        var target = parts[1];
+        var pinned = parts.Length >= 3 && parts[2].StartsWith("p", StringComparison.OrdinalIgnoreCase);
+
+        var status = await _bot.SendMessage(convo.ChatId,
+            pinned ? "Fetching pinned stories…" : "Fetching active stories…",
+            cancellationToken: ct);
+
+        try
+        {
+            var client = await _sessionPool.AcquireAsync(convo.UserId, ct);
+            var (peer, peerId) = await _telegram.ResolvePeerAsync(client, target, ct);
+
+            var items = pinned
+                ? await _telegram.GetPinnedStoriesAsync(client, peer, peerId, limit: 50,
+                    kinds: new HashSet<MediaKind>(), ct)
+                : await _telegram.GetActiveStoriesAsync(client, peer, peerId,
+                    kinds: new HashSet<MediaKind>(), ct);
+
+            await ShowSelectionAsync(convo, items, MediaSource.Stories, status.MessageId, ct);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "/stories failed");
+            await SafeEditAsync(convo.ChatId, status.MessageId, $"Failed: {ex.Message}", ct);
+        }
+    }
+
+    // ── Selection rendering + callback handling ──────────────────────────────
+
+    private async Task ShowSelectionAsync(
+        BotConversation convo,
+        IReadOnlyList<MediaItem> items,
+        MediaSource source,
+        int statusMessageId,
+        CancellationToken ct)
+    {
+        if (items.Count == 0)
+        {
+            await SafeEditAsync(convo.ChatId, statusMessageId, "No media found.", ct);
+            return;
+        }
+
+        var token = _selections.Store(convo.UserId, items, source);
+
+        var rows = new List<InlineKeyboardButton[]>();
+        for (int i = 0; i < items.Count; i++)
+        {
+            var it = items[i];
+            var label = $"{KindIcon(it.Kind)} {Truncate(it.DisplayName, 35)} · {FormatSize(it.Size)}";
+            rows.Add([InlineKeyboardButton.WithCallbackData(label, $"pick:{token}:{i}")]);
+        }
+        rows.Add([InlineKeyboardButton.WithCallbackData("⏬ Send all", $"all:{token}")]);
+
+        var markup = new InlineKeyboardMarkup(rows);
+        await _bot.EditMessageText(convo.ChatId, statusMessageId,
+            $"Found {items.Count} item(s). Tap to send.",
+            replyMarkup: markup,
+            cancellationToken: ct);
+    }
+
+    private async Task HandleCallbackAsync(CallbackQuery cb, CancellationToken ct)
+    {
+        if (cb.Message is null || string.IsNullOrEmpty(cb.Data))
+        {
+            await _bot.AnswerCallbackQuery(cb.Id, cancellationToken: ct);
+            return;
+        }
+        var chatId = cb.Message.Chat.Id;
+        var userId = cb.From.Id;
+
+        try
+        {
+            var parts = cb.Data.Split(':');
+            var verb = parts[0];
+
+            switch (verb)
+            {
+                case "pick" when parts.Length == 3 && int.TryParse(parts[2], out var idx):
+                    await _bot.AnswerCallbackQuery(cb.Id, "Sending…", cancellationToken: ct);
+                    await SendSelectedAsync(userId, chatId, parts[1], [idx], ct);
+                    return;
+
+                case "all" when parts.Length == 2:
+                    await _bot.AnswerCallbackQuery(cb.Id, "Sending all…", cancellationToken: ct);
+                    var sel = _selections.Get(userId, parts[1]);
+                    if (sel is null)
+                    {
+                        await _bot.SendMessage(chatId, "Selection expired. Re-run the command.", cancellationToken: ct);
+                        return;
+                    }
+                    var all = Enumerable.Range(0, sel.Value.Items.Count).ToArray();
+                    await SendSelectedAsync(userId, chatId, parts[1], all, ct);
+                    return;
+
+                default:
+                    await _bot.AnswerCallbackQuery(cb.Id, cancellationToken: ct);
+                    return;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Callback failed: {Data}", cb.Data);
+            try { await _bot.AnswerCallbackQuery(cb.Id, $"Failed: {ex.Message}", showAlert: true, cancellationToken: ct); }
+            catch { /* ignore */ }
+        }
+    }
+
+    private async Task SendSelectedAsync(long userId, long chatId, string token, int[] indices, CancellationToken ct)
+    {
+        var sel = _selections.Get(userId, token);
+        if (sel is null)
+        {
+            await _bot.SendMessage(chatId, "Selection expired. Re-run the command.", cancellationToken: ct);
+            return;
+        }
+        var (items, source) = sel.Value;
+
+        var client = await _sessionPool.AcquireAsync(userId, ct);
+
+        if (source == MediaSource.ChatMessages)
+        {
+            // Try the cheap path first: forward via Telegram CDN. Falls back to
+            // download+upload per item if the source has noforwards restrictions.
+            await ForwardOrFallbackAsync(client, chatId, items, indices, ct);
+        }
+        else
+        {
+            // Stories can't be forwarded; download + upload + cache file_id.
+            foreach (var i in indices)
+            {
+                if (i < 0 || i >= items.Count) continue;
+                await DownloadAndSendAsync(client, chatId, items[i], ct);
+            }
+        }
+    }
+
+    private async Task ForwardOrFallbackAsync(
+        WTelegram.Client client, long chatId,
+        IReadOnlyList<MediaItem> items, int[] indices, CancellationToken ct)
+    {
+        var botPeer = await GetBotPeerForAsync(client, ct);
+
+        // Group by source chat so we can batch one forwardMessages call per group.
+        var byChat = indices
+            .Where(i => i >= 0 && i < items.Count)
+            .Select(i => items[i])
+            .Where(it => !it.IsStory)
+            .GroupBy(it => it.ChatId);
+
+        foreach (var group in byChat)
+        {
+            try
+            {
+                var first = group.First();
+                // Resolve the source peer from the items' chatId via the client's dialog cache.
+                var sourcePeer = await ResolvePeerByChatIdAsync(client, first.ChatId, ct);
+                var msgIds = group.Select(it => it.MsgId).ToArray();
+
+                await _telegram.ForwardMessagesAsync(client, sourcePeer, msgIds, botPeer,
+                    dropAuthor: true, ct);
+            }
+            catch (Exception ex) when (ex.Message.Contains("FORWARDS_RESTRICTED", StringComparison.OrdinalIgnoreCase))
+            {
+                _logger.LogWarning("Forward restricted; falling back to download+upload for {Count} items", group.Count());
+                foreach (var it in group)
+                    await DownloadAndSendAsync(client, chatId, it, ct);
+            }
+        }
+    }
+
+    private async Task<InputPeer> ResolvePeerByChatIdAsync(WTelegram.Client client, long chatId, CancellationToken ct)
+    {
+        var dialogs = await client.Messages_GetAllDialogs().WaitAsync(ct);
+        if (dialogs.chats.TryGetValue(chatId, out var c)) return c.ToInputPeer();
+        if (dialogs.users.TryGetValue(chatId, out var u)) return u.ToInputPeer();
+        throw new InvalidOperationException($"Chat {chatId} not found in dialogs.");
+    }
+
+    private async Task DownloadAndSendAsync(WTelegram.Client client, long destChatId, MediaItem item, CancellationToken ct)
+    {
+        // Fast path: file_id already cached for this (chatId, msgId).
+        if (await _sender.TrySendCachedMediaAsync(destChatId, item, ct))
+            return;
+
+        // Otherwise: pull bytes from Telegram (user's MTProto), upload via bot, cache file_id.
+        await _telegram.DownloadMediaAsync(client, item, onProgress: null, ct);
+
+        var localPath = ResolveLocalPath(item);
+        if (!File.Exists(localPath))
+            throw new InvalidOperationException($"Downloaded file not found at {localPath}.");
+
+        await _sender.UploadMediaAsync(destChatId, item, localPath, ct);
+    }
+
+    private string ResolveLocalPath(MediaItem item)
+    {
+        // TelegramService.DownloadMediaAsync writes into TelegramOptions.ResolvedOutputDirectory
+        // using the sanitized DisplayName. Mirror its naming so we can find the file again.
+        var dir = _telegramOptions.ResolvedOutputDirectory;
+        var fileName = Domain.Common.FileHelpers.SanitizeFileName(item.DisplayName);
+        var primary = Path.Combine(dir, fileName);
+        if (File.Exists(primary)) return primary;
+
+        // Collision suffix used by TelegramService when the primary path already existed.
+        var stem = Path.GetFileNameWithoutExtension(primary);
+        var ext = Path.GetExtension(primary);
+        var suffixed = Path.Combine(dir, $"{stem}_{item.MsgId}{ext}");
+        return suffixed;
+    }
+
+    // ── Helpers ──────────────────────────────────────────────────────────────
+
+    private async Task<bool> RequireLoginAsync(BotConversation convo, CancellationToken ct)
+    {
+        if (_sessionPool.IsCached(convo.UserId)) return true;
+        await _bot.SendMessage(convo.ChatId,
+            "You need to /login first so I can use your Telegram account.",
+            cancellationToken: ct);
+        return false;
+    }
+
+    private async Task SafeEditAsync(long chatId, int messageId, string text, CancellationToken ct)
+    {
+        try { await _bot.EditMessageText(chatId, messageId, text, cancellationToken: ct); }
+        catch (Exception ex) { _logger.LogDebug(ex, "Edit message failed"); }
+    }
+
+    private static string KindIcon(MediaKind kind) => kind switch
+    {
+        MediaKind.Video    => "📹",
+        MediaKind.Audio    => "🎵",
+        MediaKind.Photo    => "📷",
+        _                  => "📄",
+    };
+
+    private static string Truncate(string s, int max) =>
+        string.IsNullOrEmpty(s) ? "(no name)" :
+        s.Length <= max ? s : s[..(max - 1)] + "…";
+
+    private static string FormatSize(long bytes)
+    {
+        if (bytes <= 0) return "?";
+        string[] units = ["B", "KB", "MB", "GB"];
+        double v = bytes; int i = 0;
+        while (v >= 1024 && i < units.Length - 1) { v /= 1024; i++; }
+        return $"{v:0.#} {units[i]}";
     }
 }

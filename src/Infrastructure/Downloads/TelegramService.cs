@@ -245,4 +245,45 @@ public sealed class TelegramService
         _manifest.Record(item.ChatId, item.MsgId, outPath, item.IsStory);
         _logger.LogInformation("Saved {OutPath} in {Elapsed:mm\\:ss}", outPath, sw.Elapsed);
     }
+
+    /// <summary>
+    /// Forwards a single message from <paramref name="source"/> to
+    /// <paramref name="target"/> via the user's MTProto client.
+    /// All bytes travel inside Telegram's CDN — none cross our process.
+    /// </summary>
+    /// <param name="dropAuthor">If true, Telegram strips the "forwarded from …" header
+    /// so the original source is not disclosed to the recipient.</param>
+    public Task<UpdatesBase> ForwardMessageAsync(
+        Client client,
+        InputPeer source,
+        int messageId,
+        InputPeer target,
+        bool dropAuthor,
+        CancellationToken ct) =>
+        ForwardMessagesAsync(client, source, [messageId], target, dropAuthor, ct);
+
+    public async Task<UpdatesBase> ForwardMessagesAsync(
+        Client client,
+        InputPeer source,
+        int[] messageIds,
+        InputPeer target,
+        bool dropAuthor,
+        CancellationToken ct)
+    {
+        if (messageIds.Length == 0)
+            throw new ArgumentException("At least one message id is required.", nameof(messageIds));
+
+        var randomIds = new long[messageIds.Length];
+        var rng = Random.Shared;
+        for (int i = 0; i < randomIds.Length; i++)
+            randomIds[i] = rng.NextInt64();
+
+        return await client.Messages_ForwardMessages(
+            from_peer: source,
+            id: messageIds,
+            random_id: randomIds,
+            to_peer: target,
+            drop_author: dropAuthor,
+            drop_media_captions: false).WaitAsync(ct);
+    }
 }

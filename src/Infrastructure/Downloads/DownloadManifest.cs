@@ -48,6 +48,31 @@ public sealed class DownloadManifest
         Save();
     }
 
+    /// <summary>
+    /// Returns a Telegram <c>file_id</c> previously cached for this URL key, or null.
+    /// Letting Telegram serve a cached file_id avoids re-uploading any bytes.
+    /// </summary>
+    public string? GetUrlFileId(string urlKey) =>
+        _entries.TryGetValue("fid:url:" + urlKey, out var v) ? v : null;
+
+    public void RecordUrlFileId(string urlKey, string fileId)
+    {
+        _entries["fid:url:" + urlKey] = fileId;
+        Save();
+    }
+
+    /// <summary>
+    /// Returns a Telegram <c>file_id</c> previously cached for this chat/message pair, or null.
+    /// </summary>
+    public string? GetMessageFileId(long chatId, int msgId, bool isStory) =>
+        _entries.TryGetValue("fid:" + Key(chatId, msgId, isStory), out var v) ? v : null;
+
+    public void RecordMessageFileId(long chatId, int msgId, bool isStory, string fileId)
+    {
+        _entries["fid:" + Key(chatId, msgId, isStory)] = fileId;
+        Save();
+    }
+
     private static string Key(long chatId, int msgId, bool isStory) =>
         isStory ? $"{chatId}:s{msgId}" : $"{chatId}:m{msgId}";
 
