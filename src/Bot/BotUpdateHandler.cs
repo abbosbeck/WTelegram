@@ -436,18 +436,12 @@ internal sealed class BotUpdateHandler : BackgroundService
         }
         convo.ClearPending();
 
-        // Telegram's chat picker returns Bot-API-style channel ids (-100<channel_id>);
-        // MTProto's dialog cache is keyed on the raw channel_id, so unwrap.
-        long mtprotoId = targetId < -1_000_000_000_000L
-            ? -1_000_000_000_000L - targetId
-            : targetId;
-
         // Dismiss the native reply keyboard before kicking off the long-running fetch.
-        await _bot.SendMessage(convo.ChatId, $"Using chat {mtprotoId}…",
+        await _bot.SendMessage(convo.ChatId, $"Using chat {targetId}…",
             replyMarkup: new ReplyKeyboardRemove(),
             cancellationToken: ct);
 
-        await HandleStoriesAsync(convo, $"/stories {mtprotoId}", ct);
+        await HandleStoriesAsync(convo, $"/stories {targetId}", ct);
     }
 
     private async Task HandleSharedContactAsync(BotConversation convo, TgContact contact, CancellationToken ct)
@@ -692,8 +686,7 @@ internal sealed class BotUpdateHandler : BackgroundService
                     "This channel restricts forwarding. Downloading via your account…",
                     cancellationToken: ct);
 
-                var byLinkProgress = new ProgressMessage(_bot, convo.ChatId, status.MessageId, _logger);
-                await DownloadAndSendAsync(client, convo.ChatId, item, byLinkProgress, 1, 1, ct);
+                await DownloadAndSendAsync(client, convo.ChatId, item, ct);
             }
 
             await _bot.DeleteMessage(convo.ChatId, status.MessageId, ct);
@@ -1126,60 +1119,33 @@ internal sealed class BotUpdateHandler : BackgroundService
         var (items, source) = sel.Value;
 
         var client = await _sessionPool.AcquireAsync(userId, ct);
-        var validIndices = indices.Where(i => i >= 0 && i < items.Count).ToArray();
-        if (validIndices.Length == 0) return;
-
-        var status = await _bot.SendMessage(chatId,
-            $"Preparing {validIndices.Length} item(s)…",
-            cancellationToken: ct);
-        var progress = new ProgressMessage(_bot, chatId, status.MessageId, _logger);
-
-        int sent = 0, failed = 0;
 
         if (source == MediaSource.ChatMessages)
         {
             // Try the cheap path first: forward via Telegram CDN. Falls back to
             // download+upload per item if the source has noforwards restrictions.
-            await ForwardOrFallbackAsync(client, chatId, items, validIndices, progress, ct);
-            sent = validIndices.Length; // forward batches don't expose per-item failures cleanly
+            await ForwardOrFallbackAsync(client, chatId, items, indices, ct);
         }
         else
         {
             // Stories can't be forwarded; download + upload + cache file_id.
-            for (int idx = 0; idx < validIndices.Length; idx++)
+            foreach (var i in indices)
             {
-                var it = items[validIndices[idx]];
-                try
-                {
-                    await DownloadAndSendAsync(client, chatId, it,
-                        progress, idx + 1, validIndices.Length, ct);
-                    sent++;
-                }
-                catch (OperationCanceledException) { throw; }
-                catch (Exception ex) when (FindInner<SessionExpiredException>(ex) is null)
-                {
-                    failed++;
-                    _logger.LogError(ex, "Failed to send story item {MsgId} ({Name})", it.MsgId, it.DisplayName);
-                    await progress.UpdateAsync(
-                        $"⚠️ Failed: {Truncate(it.DisplayName, 40)} — {ex.Message}", ct);
-                }
+                if (i < 0 || i >= items.Count) continue;
+                await DownloadAndSendAsync(client, chatId, items[i], ct);
             }
         }
-
-        var summary = failed == 0
-            ? $"✅ Sent {sent} item(s)."
-            : $"⚠️ {sent} sent, {failed} failed (see logs).";
-        await progress.FinalizeAsync(summary, ct);
     }
 
     private async Task ForwardOrFallbackAsync(
         WTelegram.Client client, long chatId,
-        IReadOnlyList<MediaItem> items, int[] indices, ProgressMessage progress, CancellationToken ct)
+        IReadOnlyList<MediaItem> items, int[] indices, CancellationToken ct)
     {
         var botPeer = await GetBotPeerForAsync(client, ct);
-        await progress.UpdateAsync($"Forwarding {indices.Length} item(s) via Telegram CDN…", ct);
 
+        // Group by source chat so we can batch one forwardMessages call per group.
         var byChat = indices
+            .Where(i => i >= 0 && i < items.Count)
             .Select(i => items[i])
             .Where(it => !it.IsStory)
             .GroupBy(it => it.ChatId);
@@ -1189,22 +1155,18 @@ internal sealed class BotUpdateHandler : BackgroundService
             try
             {
                 var first = group.First();
+                // Resolve the source peer from the items' chatId via the client's dialog cache.
                 var sourcePeer = await ResolvePeerByChatIdAsync(client, first.ChatId, ct);
                 var msgIds = group.Select(it => it.MsgId).ToArray();
 
                 await _telegram.ForwardMessagesAsync(client, sourcePeer, msgIds, botPeer,
                     dropAuthor: true, ct);
             }
-            catch (Exception ex) when (IsForwardRestricted(ex))
+            catch (Exception ex) when (ex.Message.Contains("FORWARDS_RESTRICTED", StringComparison.OrdinalIgnoreCase))
             {
                 _logger.LogWarning("Forward restricted; falling back to download+upload for {Count} items", group.Count());
-                int n = 0;
-                var list = group.ToList();
-                foreach (var it in list)
-                {
-                    n++;
-                    await DownloadAndSendAsync(client, chatId, it, progress, n, list.Count, ct);
-                }
+                foreach (var it in group)
+                    await DownloadAndSendAsync(client, chatId, it, ct);
             }
         }
     }
@@ -1217,55 +1179,20 @@ internal sealed class BotUpdateHandler : BackgroundService
         throw new InvalidOperationException($"Chat {chatId} not found in dialogs.");
     }
 
-    private async Task DownloadAndSendAsync(
-        WTelegram.Client client, long destChatId, MediaItem item,
-        ProgressMessage? progress = null, int? indexOneBased = null, int? total = null,
-        CancellationToken ct = default)
+    private async Task DownloadAndSendAsync(WTelegram.Client client, long destChatId, MediaItem item, CancellationToken ct)
     {
-        string suffix = (indexOneBased is int i && total is int t) ? $" ({i}/{t})" : "";
-        string shortName = Truncate(item.DisplayName, 40);
-
         // Fast path: file_id already cached for this (chatId, msgId).
-        if (progress is not null)
-            await progress.UpdateAsync($"🚀 Sending from cache{suffix}: {shortName}…", ct);
         if (await _sender.TrySendCachedMediaAsync(destChatId, item, ct))
-        {
-            if (progress is not null)
-                await progress.UpdateAsync($"✅ Sent (cached){suffix}: {shortName}", ct);
             return;
-        }
 
         // Otherwise: pull bytes from Telegram (user's MTProto), upload via bot, cache file_id.
-        if (progress is not null)
-            await progress.UpdateAsync($"📥 Downloading{suffix}: {shortName}…", ct);
-
-        Action<long, long, TimeSpan>? onProgress = null;
-        if (progress is not null)
-        {
-            onProgress = (transferred, totalBytes, elapsed) =>
-            {
-                double pct = totalBytes > 0 ? (transferred * 100.0 / totalBytes) : 0;
-                double mbps = elapsed.TotalSeconds > 0 ? (transferred / 1024.0 / 1024.0 / elapsed.TotalSeconds) : 0;
-                _ = progress.UpdateAsync(
-                    $"📥 Downloading{suffix}: {shortName}\n" +
-                    $"{pct:0.0}% · {FormatSize(transferred)} / {FormatSize(totalBytes)} · {mbps:0.0} MB/s",
-                    ct);
-            };
-        }
-
-        await _telegram.DownloadMediaAsync(client, item, onProgress, ct);
+        await _telegram.DownloadMediaAsync(client, item, onProgress: null, ct);
 
         var localPath = ResolveLocalPath(item);
         if (!File.Exists(localPath))
             throw new InvalidOperationException($"Downloaded file not found at {localPath}.");
 
-        if (progress is not null)
-            await progress.UpdateAsync($"📤 Uploading{suffix}: {shortName}…", ct);
-
         await _sender.UploadMediaAsync(destChatId, item, localPath, ct);
-
-        if (progress is not null)
-            await progress.UpdateAsync($"✅ Sent{suffix}: {shortName}", ct);
     }
 
     private string ResolveLocalPath(MediaItem item)

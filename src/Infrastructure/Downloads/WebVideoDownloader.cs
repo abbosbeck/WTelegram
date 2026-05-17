@@ -132,6 +132,11 @@ public sealed class WebVideoDownloader
 
         var ytdl = await EnsureReadyAsync(ct);
 
+        // Give every download a GUID filename. Avoids any Unicode/normalization
+        // headaches and keeps the path predictable for our locator below.
+        var baseName = "dl_" + Guid.NewGuid().ToString("N");
+        var outputTemplate = baseName + ".%(ext)s";
+
         // Prefer h264+aac in mp4 containers so Telegram can stream without re-encoding.
         // Falls back to whatever's available for sites that don't expose mp4 (we then
         // rely on MergeOutputFormat=mp4 + ffmpeg to remux into a streamable container).
@@ -145,6 +150,7 @@ public sealed class WebVideoDownloader
         {
             Format = format,
             NoPlaylist = true,
+            Output = outputTemplate,
         };
         if (!audioOnly)
         {
@@ -174,6 +180,15 @@ public sealed class WebVideoDownloader
         }
 
         var path = result.Data;
+        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+        {
+            // yt-dlp's reported path occasionally lags the actual on-disk one
+            // (merge step, extension swap). Glob by our known base name.
+            path = Directory.EnumerateFiles(_telegramOptions.ResolvedOutputDirectory, baseName + ".*")
+                .FirstOrDefault()
+                ?? throw new InvalidOperationException(
+                    $"yt-dlp finished but no file matching '{baseName}.*' was found in '{_telegramOptions.ResolvedOutputDirectory}'.");
+        }
         _manifest.RecordUrl(key, path);
         _logger.LogInformation("Saved {Path}", path);
         return path;
