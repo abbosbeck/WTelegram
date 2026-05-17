@@ -929,15 +929,14 @@ internal sealed class BotUpdateHandler : BackgroundService
                 case "qx" when parts.Length == 2:
                     _pending.ForgetUrl(userId, parts[1]);
                     await _bot.AnswerCallbackQuery(cb.Id, "Cancelled", cancellationToken: ct);
-                    await SafeEditAsync(chatId, cb.Message.MessageId, "Cancelled.", ct);
+                    await EditIntoMenuAsync(chatId, cb.Message.MessageId, ct);
                     return;
 
                 // Cancel from the unified "Download by link" prompt.
                 case "dlx" when parts.Length == 1:
                     convo.ClearPending();
                     await _bot.AnswerCallbackQuery(cb.Id, "Cancelled", cancellationToken: ct);
-                    await SafeEditAsync(chatId, cb.Message.MessageId, "Cancelled.", ct);
-                    await SendMenuAsync(chatId, "What would you like to do?", ct);
+                    await EditIntoMenuAsync(chatId, cb.Message.MessageId, ct);
                     return;
 
                 default:
@@ -1277,6 +1276,31 @@ internal sealed class BotUpdateHandler : BackgroundService
             "You need to /login first so I can use your Telegram account.",
             cancellationToken: ct);
         return false;
+    }
+
+    /// <summary>
+    /// Edits an existing message (typically a stale prompt or status) into the
+    /// main menu. Keeps the chat tidy: one message, no leftover "Cancelled." line.
+    /// </summary>
+    private async Task EditIntoMenuAsync(long chatId, int messageId, CancellationToken ct)
+    {
+        var rows = new InlineKeyboardButton[][]
+        {
+            [InlineKeyboardButton.WithCallbackData("📥 Download by link", "m:dl")],
+            [InlineKeyboardButton.WithCallbackData("▶️ From chat",         "m:chat"),
+             InlineKeyboardButton.WithCallbackData("🔍 Search",            "m:search")],
+            [InlineKeyboardButton.WithCallbackData("📖 Stories",            "m:stories"),
+             InlineKeyboardButton.WithCallbackData("📖 Pinned stories",     "m:pstories")],
+            [InlineKeyboardButton.WithCallbackData("📊 Status",             "m:status")],
+        };
+        try
+        {
+            await _bot.EditMessageText(chatId, messageId,
+                "What would you like to do?",
+                replyMarkup: new InlineKeyboardMarkup(rows),
+                cancellationToken: ct);
+        }
+        catch (Exception ex) { _logger.LogDebug(ex, "Edit-into-menu failed"); }
     }
 
     private async Task SafeEditAsync(long chatId, int messageId, string text, CancellationToken ct)
