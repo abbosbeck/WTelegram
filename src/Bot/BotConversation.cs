@@ -51,5 +51,4 @@ internal enum PendingAction
     AwaitingSearchTarget,
     AwaitingSearchQuery,
     AwaitingStoriesTarget,
-    AwaitingStoriesPinnedTarget,
 }

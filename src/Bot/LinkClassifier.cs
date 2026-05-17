@@ -32,6 +32,26 @@ internal static class LinkClassifier
         @"^@[A-Za-z0-9_]{4,32}$",
         RegexOptions.Compiled);
 
+    // t.me/<user> or https://t.me/<user> — username only, no message id.
+    private static readonly Regex TmeUserOnly = new(
+        @"^(?:https?://)?(?:t|telegram)\.me/(?<user>[A-Za-z0-9_]{4,32})/?(?:\?\S*)?$",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    /// <summary>
+    /// Accepts the various ways a user might type a Telegram peer reference and
+    /// returns a form the MTProto resolver understands:
+    ///   "@user" / "user" / "t.me/user" / "https://t.me/user" → "@user"
+    ///   "12345" → "12345"
+    /// </summary>
+    public static string NormalizePeerTarget(string input)
+    {
+        var s = input?.Trim() ?? "";
+        if (s.Length == 0) return s;
+        var m = TmeUserOnly.Match(s);
+        if (m.Success) return "@" + m.Groups["user"].Value;
+        return s;
+    }
+
     public static LinkClassification Classify(string input)
     {
         var s = input?.Trim() ?? "";

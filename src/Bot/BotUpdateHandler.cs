@@ -113,7 +113,42 @@ internal sealed class BotUpdateHandler : BackgroundService
     {
         if (update.CallbackQuery is { } cb)
         {
-            await HandleCallbackAsync(cb, ct);
+            var cbChatId = cb.Message?.Chat.Id ?? cb.From.Id;
+            var cbConvo = _conversations.GetOrAdd(cbChatId, _ => new BotConversation(cbChatId, cb.From.Id));
+            try
+            {
+                await HandleCallbackAsync(cb, ct);
+            }
+            catch (SessionExpiredException)
+            {
+                cbConvo.ClearPending();
+                cbConvo.Step = LoginStep.Idle;
+                cbConvo.Login = null;
+                try { await _bot.AnswerCallbackQuery(cb.Id, "Session expired — send /login.", showAlert: true, cancellationToken: ct); }
+                catch { /* ignore */ }
+                try
+                {
+                    await _bot.SendMessage(cbChatId,
+                        "⚠️ Your Telegram session is no longer valid.\n\nSend /login to sign in again.",
+                        cancellationToken: ct);
+                }
+                catch { /* ignore */ }
+            }
+            catch (Exception ex) when (FindInner<SessionExpiredException>(ex) is not null)
+            {
+                cbConvo.ClearPending();
+                cbConvo.Step = LoginStep.Idle;
+                cbConvo.Login = null;
+                try { await _bot.AnswerCallbackQuery(cb.Id, "Session expired — send /login.", showAlert: true, cancellationToken: ct); }
+                catch { /* ignore */ }
+                try
+                {
+                    await _bot.SendMessage(cbChatId,
+                        "⚠️ Your Telegram session is no longer valid.\n\nSend /login to sign in again.",
+                        cancellationToken: ct);
+                }
+                catch { /* ignore */ }
+            }
             return;
         }
 
@@ -132,6 +167,32 @@ internal sealed class BotUpdateHandler : BackgroundService
             {
                 _logger.LogError(ex, "Failed to handle shared contact for chat {ChatId}", chatId);
                 try { await _bot.SendMessage(chatId, $"Couldn't process the contact: {ex.Message}", cancellationToken: ct); }
+                catch { /* ignore */ }
+            }
+            return;
+        }
+
+        // Native "Pick a user" / "Pick a channel" pickers (used by the stories prompt).
+        if (message.UsersShared is { } usersShared && usersShared.Users is { Length: > 0 })
+        {
+            try { await HandleSharedChatTargetAsync(convo, usersShared.Users[0].UserId, ct); }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to handle shared user for chat {ChatId}", chatId);
+                try { await _bot.SendMessage(chatId, $"Couldn't use that user: {ex.Message}",
+                    replyMarkup: new ReplyKeyboardRemove(), cancellationToken: ct); }
+                catch { /* ignore */ }
+            }
+            return;
+        }
+        if (message.ChatShared is { } chatShared)
+        {
+            try { await HandleSharedChatTargetAsync(convo, chatShared.ChatId, ct); }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to handle shared chat for chat {ChatId}", chatId);
+                try { await _bot.SendMessage(chatId, $"Couldn't use that chat: {ex.Message}",
+                    replyMarkup: new ReplyKeyboardRemove(), cancellationToken: ct); }
                 catch { /* ignore */ }
             }
             return;
@@ -189,8 +250,15 @@ internal sealed class BotUpdateHandler : BackgroundService
                 }
             }
 
-            // Plain text — dispatch to a pending menu-driven action first,
-            // then fall back to the login state machine.
+            // Plain text — if a login is actively in progress, the state machine
+            // takes precedence so a stale pending action (e.g. AwaitingStoriesTarget)
+            // can't accidentally consume the user's phone / code / password.
+            if (convo.Step != LoginStep.Idle && convo.Login is not null)
+            {
+                await HandleLoginInputAsync(convo, text, message.MessageId, ct);
+                return;
+            }
+
             if (await TryHandlePendingAsync(convo, text, message.MessageId, ct))
                 return;
             await HandleLoginInputAsync(convo, text, message.MessageId, ct);
@@ -311,6 +379,8 @@ internal sealed class BotUpdateHandler : BackgroundService
         // (all TCSes already completed with the old phone/code). Drop it so
         // we start the credentials flow from a clean state.
         _loginCoordinator.Cancel(convo.UserId);
+        // Drop any menu-driven pending action so it can't consume the phone/code.
+        convo.ClearPending();
 
         var login = new LoginSession(convo.UserId);
         if (!_loginCoordinator.TryRegister(convo.UserId, login))
@@ -351,6 +421,27 @@ internal sealed class BotUpdateHandler : BackgroundService
             parseMode: ParseMode.Html,
             replyMarkup: keyboard,
             cancellationToken: ct);
+    }
+
+    private async Task HandleSharedChatTargetAsync(BotConversation convo, long targetId, CancellationToken ct)
+    {
+        // Sanity check — only consume the share if we're actually awaiting a stories target.
+        if (convo.Pending != PendingAction.AwaitingStoriesTarget)
+        {
+            await _bot.SendMessage(convo.ChatId,
+                "That share came in at the wrong time. Tap a menu button first.",
+                replyMarkup: new ReplyKeyboardRemove(),
+                cancellationToken: ct);
+            return;
+        }
+        convo.ClearPending();
+
+        // Dismiss the native reply keyboard before kicking off the long-running fetch.
+        await _bot.SendMessage(convo.ChatId, $"Using chat {targetId}…",
+            replyMarkup: new ReplyKeyboardRemove(),
+            cancellationToken: ct);
+
+        await HandleStoriesAsync(convo, $"/stories {targetId}", ct);
     }
 
     private async Task HandleSharedContactAsync(BotConversation convo, TgContact contact, CancellationToken ct)
@@ -580,9 +671,6 @@ internal sealed class BotUpdateHandler : BackgroundService
             }
             catch (Exception ex) when (IsForwardRestricted(ex))
             {
-                // Restricted channels ("Restrict saving content"): the cheap forward
-                // path is blocked. Fall back to download-via-user-MTProto → upload-via-bot,
-                // which is allowed because the user's account is a member of the channel.
                 _logger.LogInformation("Forward restricted for {Link}; falling back to download+upload", link);
 
                 var item = MediaItem.TryFrom(GetChatIdForPeer(sourcePeer), message);
@@ -830,6 +918,31 @@ internal sealed class BotUpdateHandler : BackgroundService
 
     // ── /stories ─────────────────────────────────────────────────────────────
 
+    private async Task PromptForStoriesTargetAsync(BotConversation convo, CancellationToken ct)
+    {
+        // Telegram's native pickers — single-select, server-side. They return
+        // a UsersShared / ChatShared payload on the user's next message.
+        var keyboard = new TgReplyKeyboardMarkup(new[]
+        {
+            new[]
+            {
+                TgKeyboardButton.WithRequestUsers("👤 Pick a user", requestId: 1),
+                TgKeyboardButton.WithRequestChat("📣 Pick a channel", requestId: 2, chatIsChannel: true),
+            },
+        })
+        { ResizeKeyboard = true, OneTimeKeyboard = true };
+
+        await _bot.SendMessage(convo.ChatId,
+            "Send a user/channel — any of these works:\n" +
+            "• <code>@username</code>\n" +
+            "• <code>username</code>, <code>t.me/username</code>, <code>https://t.me/username</code>\n" +
+            "• numeric id\n\n" +
+            "Or tap a button to pick natively from Telegram.",
+            parseMode: ParseMode.Html,
+            replyMarkup: keyboard,
+            cancellationToken: ct);
+    }
+
     private async Task HandleStoriesAsync(BotConversation convo, string text, CancellationToken ct)
     {
         if (!await RequireLoginAsync(convo, ct)) return;
@@ -838,35 +951,53 @@ internal sealed class BotUpdateHandler : BackgroundService
         if (parts.Length < 2)
         {
             await _bot.SendMessage(convo.ChatId,
-                "Usage: /stories <@username|id> [pinned]",
+                "Usage: /stories <@username|id>",
                 cancellationToken: ct);
             return;
         }
         var target = parts[1];
-        var pinned = parts.Length >= 3 && parts[2].StartsWith("p", StringComparison.OrdinalIgnoreCase);
 
         var status = await _bot.SendMessage(convo.ChatId,
-            pinned ? "Fetching pinned stories…" : "Fetching active stories…",
+            "Fetching stories (active + pinned)…",
             cancellationToken: ct);
 
         try
         {
             var client = await _sessionPool.AcquireAsync(convo.UserId, ct);
             var (peer, peerId) = await _telegram.ResolvePeerAsync(client, target, ct);
+            var kinds = new HashSet<MediaKind>();
 
-            var items = pinned
-                ? await _telegram.GetPinnedStoriesAsync(client, peer, peerId, limit: 50,
-                    kinds: new HashSet<MediaKind>(), ct)
-                : await _telegram.GetActiveStoriesAsync(client, peer, peerId,
-                    kinds: new HashSet<MediaKind>(), ct);
+            // Fetch both in parallel; ignore one if it fails so the user still sees the other.
+            var activeTask = SafeFetchStoriesAsync(
+                () => _telegram.GetActiveStoriesAsync(client, peer, peerId, kinds, ct), "active");
+            var pinnedTask = SafeFetchStoriesAsync(
+                () => _telegram.GetPinnedStoriesAsync(client, peer, peerId, limit: 50, kinds, ct), "pinned");
+            await Task.WhenAll(activeTask, pinnedTask);
 
-            await ShowSelectionAsync(convo, items, MediaSource.Stories, status.MessageId, ct);
+            // Dedupe by MsgId — a pinned story can also be active.
+            var seen = new HashSet<int>();
+            var merged = new List<MediaItem>();
+            foreach (var it in activeTask.Result.Concat(pinnedTask.Result))
+                if (seen.Add(it.MsgId)) merged.Add(it);
+
+            await ShowSelectionAsync(convo, merged, MediaSource.Stories, status.MessageId, ct);
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception ex) when (FindInner<SessionExpiredException>(ex) is null)
         {
             _logger.LogError(ex, "/stories failed");
             await SafeEditAsync(convo.ChatId, status.MessageId, $"Failed: {ex.Message}", ct);
+        }
+    }
+
+    private async Task<IReadOnlyList<MediaItem>> SafeFetchStoriesAsync(
+        Func<Task<IReadOnlyList<MediaItem>>> fetch, string label)
+    {
+        try { return await fetch(); }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to fetch {Label} stories", label);
+            return Array.Empty<MediaItem>();
         }
     }
 
@@ -1098,8 +1229,7 @@ internal sealed class BotUpdateHandler : BackgroundService
             [InlineKeyboardButton.WithCallbackData("📥 Download by link", "m:dl")],
             [InlineKeyboardButton.WithCallbackData("▶️ From chat",         "m:chat"),
              InlineKeyboardButton.WithCallbackData("🔍 Search",            "m:search")],
-            [InlineKeyboardButton.WithCallbackData("📖 Stories",            "m:stories"),
-             InlineKeyboardButton.WithCallbackData("📖 Pinned stories",     "m:pstories")],
+            [InlineKeyboardButton.WithCallbackData("📖 Stories",            "m:stories")],
             [InlineKeyboardButton.WithCallbackData("📊 Status",             "m:status")],
         };
         try
@@ -1114,7 +1244,7 @@ internal sealed class BotUpdateHandler : BackgroundService
     private async Task HandleMenuButtonAsync(BotConversation convo, string action, int menuMessageId, CancellationToken ct)
     {
         // Sub-flows that need a session must verify it first.
-        bool needsLogin = action is "dl" or "chat" or "search" or "stories" or "pstories";
+        bool needsLogin = action is "dl" or "chat" or "search" or "stories";
         if (needsLogin && !await RequireLoginAsync(convo, ct)) return;
 
         switch (action)
@@ -1145,13 +1275,7 @@ internal sealed class BotUpdateHandler : BackgroundService
             case "stories":
                 convo.ClearPending();
                 convo.Pending = PendingAction.AwaitingStoriesTarget;
-                await _bot.SendMessage(convo.ChatId, "Send the user/channel for active stories.", cancellationToken: ct);
-                return;
-
-            case "pstories":
-                convo.ClearPending();
-                convo.Pending = PendingAction.AwaitingStoriesPinnedTarget;
-                await _bot.SendMessage(convo.ChatId, "Send the user/channel for pinned stories.", cancellationToken: ct);
+                await PromptForStoriesTargetAsync(convo, ct);
                 return;
 
             case "status":
@@ -1209,12 +1333,8 @@ internal sealed class BotUpdateHandler : BackgroundService
 
             case PendingAction.AwaitingStoriesTarget:
                 convo.ClearPending();
-                await HandleStoriesAsync(convo, $"/stories {text}", ct);
-                return true;
-
-            case PendingAction.AwaitingStoriesPinnedTarget:
-                convo.ClearPending();
-                await HandleStoriesAsync(convo, $"/stories {text} pinned", ct);
+                var normalized = LinkClassifier.NormalizePeerTarget(text);
+                await HandleStoriesAsync(convo, $"/stories {normalized}", ct);
                 return true;
 
             default:
@@ -1341,8 +1461,7 @@ internal sealed class BotUpdateHandler : BackgroundService
             [InlineKeyboardButton.WithCallbackData("📥 Download by link", "m:dl")],
             [InlineKeyboardButton.WithCallbackData("▶️ From chat",         "m:chat"),
              InlineKeyboardButton.WithCallbackData("🔍 Search",            "m:search")],
-            [InlineKeyboardButton.WithCallbackData("📖 Stories",            "m:stories"),
-             InlineKeyboardButton.WithCallbackData("📖 Pinned stories",     "m:pstories")],
+            [InlineKeyboardButton.WithCallbackData("📖 Stories",            "m:stories")],
             [InlineKeyboardButton.WithCallbackData("📊 Status",             "m:status")],
         };
         try
