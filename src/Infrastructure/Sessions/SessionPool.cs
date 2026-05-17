@@ -160,8 +160,13 @@ public sealed class SessionPool : IAsyncDisposable
 
     private string AwaitFromLogin(long userId, Func<LoginSession, Task<string>> selector)
     {
-        var login = _loginCoordinator.Get(userId)
-            ?? throw new SessionExpiredException(userId);
+        var login = _loginCoordinator.Get(userId);
+
+        if(login is null)
+        {
+            var user = _store.LoadAsync(userId, CancellationToken.None).GetAwaiter().GetResult();
+        }
+
         return selector(login).GetAwaiter().GetResult();
     }
 
