@@ -568,13 +568,38 @@ internal sealed class BotUpdateHandler : BackgroundService
             await _bot.EditMessageText(convo.ChatId, status.MessageId,
                 "Forwarding via Telegram CDN…", cancellationToken: ct);
 
-            await _telegram.ForwardMessageAsync(
-                client,
-                source: sourcePeer,
-                messageId: message.ID,
-                target: botPeer,
-                dropAuthor: true,
-                ct);
+            try
+            {
+                await _telegram.ForwardMessageAsync(
+                    client,
+                    source: sourcePeer,
+                    messageId: message.ID,
+                    target: botPeer,
+                    dropAuthor: true,
+                    ct);
+            }
+            catch (Exception ex) when (IsForwardRestricted(ex))
+            {
+                // Restricted channels ("Restrict saving content"): the cheap forward
+                // path is blocked. Fall back to download-via-user-MTProto → upload-via-bot,
+                // which is allowed because the user's account is a member of the channel.
+                _logger.LogInformation("Forward restricted for {Link}; falling back to download+upload", link);
+
+                var item = MediaItem.TryFrom(GetChatIdForPeer(sourcePeer), message);
+                if (item is null)
+                {
+                    await SafeEditAsync(convo.ChatId, status.MessageId,
+                        "This message has no downloadable media (text-only or unsupported type).", ct);
+                    await SendMenuAsync(convo.ChatId, "What would you like to do next?", ct);
+                    return;
+                }
+
+                await _bot.EditMessageText(convo.ChatId, status.MessageId,
+                    "This channel restricts forwarding. Downloading via your account…",
+                    cancellationToken: ct);
+
+                await DownloadAndSendAsync(client, convo.ChatId, item, ct);
+            }
 
             await _bot.DeleteMessage(convo.ChatId, status.MessageId, ct);
             await SendMenuAsync(convo.ChatId, "Done. What's next?", ct);
@@ -1267,6 +1292,33 @@ internal sealed class BotUpdateHandler : BackgroundService
     /// rehydrated in-memory, or sitting encrypted in Postgres ready to be loaded.
     /// Only prompts the user to /login when neither is true.
     /// </summary>
+    private static long GetChatIdForPeer(InputPeer peer) => peer switch
+    {
+        InputPeerChannel c => c.channel_id,
+        InputPeerChat g    => g.chat_id,
+        InputPeerUser u    => u.user_id,
+        _                  => 0,
+    };
+
+    /// <summary>
+    /// Returns true if the exception indicates the source chat forbids forwarding
+    /// (channel owner enabled "Restrict saving content"). Telegram returns this
+    /// under a handful of error codes; match them all.
+    /// </summary>
+    private static bool IsForwardRestricted(Exception ex)
+    {
+        for (var e = ex; e is not null; e = e.InnerException!)
+        {
+            var m = e.Message;
+            if (m is null) continue;
+            if (m.Contains("FORWARDS_RESTRICTED", StringComparison.OrdinalIgnoreCase) ||
+                m.Contains("CHAT_SEND_MEDIA_FORBIDDEN", StringComparison.OrdinalIgnoreCase) ||
+                m.Contains("NOFORWARDS", StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
+
     private async Task<bool> RequireLoginAsync(BotConversation convo, CancellationToken ct)
     {
         if (_sessionPool.IsCached(convo.UserId)) return true;
