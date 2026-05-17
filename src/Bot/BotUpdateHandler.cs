@@ -399,9 +399,9 @@ internal sealed class BotUpdateHandler : BackgroundService
     {
         if (convo.Login is null || convo.Step == LoginStep.Idle)
         {
-            await _bot.SendMessage(convo.ChatId,
-                "Nothing to do. Send /login to begin.",
-                cancellationToken: ct);
+            // Plain text with nothing pending and no login flow — show the menu
+            // so the user has something to tap instead of a dead-end message.
+            await SendMenuAsync(convo.ChatId, "I didn't catch that. What would you like to do?", ct);
             return;
         }
 
