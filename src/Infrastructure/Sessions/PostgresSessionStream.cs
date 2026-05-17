@@ -50,17 +50,41 @@ internal sealed class PostgresSessionStream : Stream
             _lastFlush = DateTime.UtcNow;
         }
 
-        _ = Task.Run(async () =>
+        // Synchronous: the very first auth_key MUST be in Postgres before this returns,
+        // otherwise a non-graceful shutdown (VS "Stop Debugging", Ctrl-C, crash) would
+        // lose the session and force the user to log in again on the next start.
+        try
         {
-            try
-            {
-                await _store.SaveAsync(_userId, snapshot, phone, displayName);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Failed to persist session identity for user {UserId}", _userId);
-            }
-        });
+            _store.SaveAsync(_userId, snapshot, phone, displayName).GetAwaiter().GetResult();
+            _logger.LogInformation("Persisted initial session for user {UserId} ({Bytes} bytes)", _userId, snapshot.Length);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to persist session identity for user {UserId}", _userId);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Forces any pending bytes to disk, awaitable. Use right after a successful
+    /// login so the post-login auth_key/salt updates are durable immediately.
+    /// </summary>
+    public async Task FlushNowAsync(CancellationToken ct = default)
+    {
+        byte[]? snapshot;
+        string? phone;
+        string? name;
+        lock (_flushLock)
+        {
+            if (!_dirty) return;
+            snapshot = _buffer.ToArray();
+            phone = _phone;
+            name = _displayName;
+            _dirty = false;
+            _lastFlush = DateTime.UtcNow;
+        }
+        await _store.SaveAsync(_userId, snapshot!, phone, name, ct);
+        _logger.LogInformation("Flushed session for user {UserId} ({Bytes} bytes)", _userId, snapshot!.Length);
     }
 
     public override bool CanRead => true;

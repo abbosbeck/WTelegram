@@ -66,6 +66,8 @@ public sealed class SessionPool : IAsyncDisposable
             {
                 var me = await client.LoginUserIfNeeded().WaitAsync(ct);
                 stream.SetIdentity(me?.phone, BuildDisplayName(me));
+
+                await stream.FlushNowAsync(ct);
                 await _store.TouchAsync(userId, ct);
                 entry.Client = client;
                 _loginCoordinator.Complete(userId);

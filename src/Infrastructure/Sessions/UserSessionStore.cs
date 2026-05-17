@@ -35,10 +35,17 @@ public sealed class UserSessionStore : IUserSessionStore
         await using var db = await _dbFactory.CreateDbContextAsync(ct);
         var row = await db.UserSessions.AsNoTracking()
             .FirstOrDefaultAsync(x => x.TelegramUserId == userId && x.IsActive, ct);
-        if (row is null) return null;
+        if (row is null)
+        {
+            _logger.LogInformation("No stored session for user {UserId} — fresh login required", userId);
+            return null;
+        }
         try
         {
-            return _cipher.Decrypt(row.SessionBytes, row.Nonce, row.Tag);
+            var bytes = _cipher.Decrypt(row.SessionBytes, row.Nonce, row.Tag);
+            _logger.LogInformation("Loaded session for user {UserId} ({Bytes} bytes, last used {LastUsedAt:u})",
+                userId, bytes.Length, row.LastUsedAt);
+            return bytes;
         }
         catch (Exception ex)
         {
