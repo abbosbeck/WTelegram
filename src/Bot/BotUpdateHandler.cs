@@ -402,6 +402,12 @@ internal sealed class BotUpdateHandler : BackgroundService
             {
                 await NotifyLoginCompletedAsync(convo, success: false, message: "Login cancelled.");
             }
+            catch (FloodWaitException fw)
+            {
+                _logger.LogWarning("Login flood-wait for user {UserId}: {Seconds}s", convo.UserId, fw.Seconds);
+                await NotifyLoginCompletedAsync(convo, success: false,
+                    message: $"⏳ {fw.Message}");
+            }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Login failed for user {UserId}", convo.UserId);

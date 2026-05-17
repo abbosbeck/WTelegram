@@ -24,6 +24,7 @@ public sealed class SessionPool : IAsyncDisposable
 
     private readonly ConcurrentDictionary<long, Entry> _entries = new();
     private readonly SemaphoreSlim _capacityLock = new(1, 1);
+    private readonly ConcurrentDictionary<long, DateTime> _floodWaitUntil = new();
 
     public SessionPool(
         IOptions<TelegramOptions> telegramOptions,
@@ -45,6 +46,17 @@ public sealed class SessionPool : IAsyncDisposable
         if (_telegramOptions.ApiId == 0 || string.IsNullOrWhiteSpace(_telegramOptions.ApiHash))
             throw new InvalidOperationException(
                 "Telegram:ApiId / Telegram:ApiHash are not configured.");
+
+        // Self-throttle: if Telegram told us to wait, don't even try again until then.
+        if (_floodWaitUntil.TryGetValue(userId, out var until) && until > DateTime.UtcNow)
+        {
+            var remaining = (int)Math.Ceiling((until - DateTime.UtcNow).TotalSeconds);
+            throw new FloodWaitException(remaining, FormatFloodWaitMessage(remaining));
+        }
+        else if (until != default)
+        {
+            _floodWaitUntil.TryRemove(userId, out _);
+        }
 
         var entry = _entries.GetOrAdd(userId, id => new Entry(id));
         await entry.InitLock.WaitAsync(ct);
@@ -74,6 +86,17 @@ public sealed class SessionPool : IAsyncDisposable
                 _logger.LogInformation("Session acquired for user {UserId} ({Name})", userId, me?.username ?? me?.first_name);
                 return client;
             }
+            catch (TL.RpcException rpc) when (rpc.Code == 420)
+            {
+                // FLOOD_WAIT_X — Telegram's rate-limit. Record cooldown and rethrow cleanly.
+                var seconds = rpc.X > 0 ? rpc.X : 60;
+                _floodWaitUntil[userId] = DateTime.UtcNow.AddSeconds(seconds);
+                client.Dispose();
+                stream.Dispose();
+                _entries.TryRemove(userId, out _);
+                _logger.LogWarning("FLOOD_WAIT_{Seconds}s for user {UserId}", seconds, userId);
+                throw new FloodWaitException(seconds, FormatFloodWaitMessage(seconds));
+            }
             catch (Exception ex) when (UnwrapSessionExpired(ex) is SessionExpiredException expired)
             {
                 // The stored bytes are useless — drop them so a fresh /login
@@ -97,6 +120,14 @@ public sealed class SessionPool : IAsyncDisposable
         {
             entry.InitLock.Release();
         }
+    }
+
+    private static string FormatFloodWaitMessage(int seconds)
+    {
+        var minutes = seconds / 60.0;
+        return minutes >= 1
+            ? $"Telegram rate-limited login: wait {seconds}s (≈ {minutes:0.#} min) before retrying."
+            : $"Telegram rate-limited login: wait {seconds}s before retrying.";
     }
 
     public bool IsCached(long userId) =>
